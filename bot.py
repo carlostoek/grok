@@ -31,7 +31,8 @@ SOURCES_DIR = Path(__file__).parent / "sources"
 MODELS = {
     "grok": {
         "key": "grok",
-        "id": "grok-imagine-image-quality",
+        "id": "grok-imagine-image-quality",           # used for xAI direct API
+        "replicate_id": "xai/grok-imagine-image-quality",  # full ref required by Replicate (from original implementation)
         "name": "Grok Imagine",
         "desc": "xAI Grok Imagine (2K)",
         "provider": "xai",
@@ -52,8 +53,22 @@ MODELS = {
     },
 }
 DEFAULT_MODEL = "grok"
+DEFAULT_GROK_PROVIDER = "xai"
 
-# Per-user state: user_id -> {model, source_path, fs_state, pending_prompt}
+GROK_PROVIDERS = {
+    "xai": {
+        "key": "xai",
+        "name": "xAI",
+        "desc": "API oficial de xAI para Grok Imagine",
+    },
+    "replicate": {
+        "key": "replicate",
+        "name": "Replicate",
+        "desc": "Grok Imagine a trav\u00e9s de Replicate",
+    },
+}
+
+# Per-user state: user_id -> {model, grok_provider, source_path, fs_state, pending_prompt}
 user_state: dict[int, dict] = {}
 
 
@@ -61,6 +76,7 @@ def get_user_state(user_id: int) -> dict:
     if user_id not in user_state:
         user_state[user_id] = {
             "model": DEFAULT_MODEL,
+            "grok_provider": DEFAULT_GROK_PROVIDER,
             "source_path": None,
             "fs_state": sessions.FsState.IDLE,
             "pending_prompt": None,
@@ -68,9 +84,29 @@ def get_user_state(user_id: int) -> dict:
     return user_state[user_id]
 
 
+def get_grok_provider(user_id: int) -> str:
+    state = get_user_state(user_id)
+    return state.get("grok_provider", DEFAULT_GROK_PROVIDER)
+
+
 def get_model(user_id: int) -> dict:
     key = get_user_state(user_id)["model"]
-    return MODELS.get(key, MODELS[DEFAULT_MODEL])
+    base = MODELS.get(key, MODELS[DEFAULT_MODEL])
+    if key == "grok":
+        m = dict(base)
+        prov = get_grok_provider(user_id)
+        m["provider"] = prov
+        # Use the correct model identifier for the chosen backend.
+        # xAI direct uses the short name; Replicate requires the full "owner/name" reference.
+        if prov == "replicate":
+            m["id"] = base.get("replicate_id", "xai/grok-imagine-image-quality")
+        else:
+            m["id"] = base.get("id", "grok-imagine-image-quality")
+        prov_label = "xAI" if prov == "xai" else "Replicate"
+        m["name"] = f"Grok Imagine ({prov_label})"
+        m["desc"] = f"xAI Grok Imagine (2K) v\u00eda {prov_label}"
+        return m
+    return base
 
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -78,11 +114,33 @@ dp = Dispatcher()
 
 
 # --- Model selection keyboard ---
-def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
+def model_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    state = get_user_state(user_id)
+    current_key = state["model"]
+    grok_prov = state.get("grok_provider", DEFAULT_GROK_PROVIDER)
     buttons = []
     for key, m in MODELS.items():
-        label = f"{'✅ ' if key == current_key else ''}{m['name']}"
+        if key == "grok":
+            suffix = "xAI" if grok_prov == "xai" else "Replicate"
+            label = f"{'✅ ' if key == current_key else ''}Grok Imagine ({suffix})"
+        else:
+            label = f"{'✅ ' if key == current_key else ''}{m['name']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"model:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def grok_provider_keyboard(current_prov: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if current_prov == 'xai' else ''}xAI (oficial)",
+            callback_data="grokprov:xai"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if current_prov == 'replicate' else ''}Replicate",
+            callback_data="grokprov:replicate"
+        )],
+        [InlineKeyboardButton(text="← Volver a modelos", callback_data="model:back")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -92,7 +150,7 @@ def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     state = get_user_state(message.from_user.id)
-    model = MODELS[state["model"]]
+    model = get_model(message.from_user.id)
 
     lines = [
         "Envame un prompt y te genero la imagen.\n",
@@ -122,10 +180,9 @@ async def cmd_start(message: types.Message):
 # ---------------------------------------------------------------------------
 @dp.message(Command("model"))
 async def cmd_model(message: types.Message):
-    current = get_model(message.from_user.id)
     await message.answer(
         "Selecciona el modelo:",
-        reply_markup=model_keyboard(current["key"]),
+        reply_markup=model_keyboard(message.from_user.id),
     )
 
 
@@ -136,6 +193,18 @@ async def handle_model_selection(callback: types.CallbackQuery):
         await callback.answer("Modelo no disponible.", show_alert=True)
         return
 
+    if model_key == "grok":
+        # Ask for provider choice instead of direct switch
+        current_prov = get_grok_provider(callback.from_user.id)
+        await callback.message.edit_text(
+            "Grok Imagine seleccionado.\n\nElige con qu\u00e9 API/proveedor quieres trabajar:",
+            parse_mode="HTML",
+            reply_markup=grok_provider_keyboard(current_prov),
+        )
+        await callback.answer()
+        return
+
+    # Non-grok models: direct switch
     state = get_user_state(callback.from_user.id)
     state["model"] = model_key
     model = MODELS[model_key]
@@ -155,9 +224,48 @@ async def handle_model_selection(callback: types.CallbackQuery):
     await callback.message.edit_text(
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=model_keyboard(model_key),
+        reply_markup=model_keyboard(callback.from_user.id),
     )
     await callback.answer(f"Modelo: {model['name']}")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("grokprov:"))
+async def handle_grok_provider(callback: types.CallbackQuery):
+    prov = callback.data.split(":", 1)[1]
+    if prov not in GROK_PROVIDERS:
+        await callback.answer("Proveedor no disponible.", show_alert=True)
+        return
+
+    state = get_user_state(callback.from_user.id)
+    state["model"] = "grok"
+    state["grok_provider"] = prov
+
+    model = get_model(callback.from_user.id)
+    prov_info = GROK_PROVIDERS[prov]
+
+    lines = [
+        f"Modelo cambiado a <b>{model['name']}</b>.\n",
+        f"Proveedor: <b>{prov_info['name']}</b>\n",
+        f"<i>{prov_info['desc']}</i>\n",
+        "Enviame un prompt para generar una imagen.",
+        "O envia una foto con caption para editarla.",
+    ]
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=model_keyboard(callback.from_user.id),
+    )
+    await callback.answer(f"Proveedor: {prov_info['name']}")
+
+
+@dp.callback_query(lambda c: c.data == "model:back")
+async def handle_model_back(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "Selecciona el modelo:",
+        reply_markup=model_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("confirm:"))
@@ -215,7 +323,7 @@ async def cmd_cambiar_source(message: types.Message):
 @dp.message(Command("estado"))
 async def cmd_estado(message: types.Message):
     state = get_user_state(message.from_user.id)
-    model = MODELS[state["model"]]
+    model = get_model(message.from_user.id)
 
     lines = [
         "Estado\n",
@@ -227,6 +335,9 @@ async def cmd_estado(message: types.Message):
         lines.append(f"Source: {'Configurado' if has_source else 'No configurado'}\n")
         lines.append(f"Estado: {state['fs_state']}")
     else:
+        if model.get("key") == "grok":
+            backend = "xAI (oficial)" if model.get("provider") == "xai" else "Replicate"
+            lines.append(f"API / Backend: {backend}\n")
         lines.append("Listo para generar/editar imagenes.")
 
     await message.answer("\n".join(lines))
@@ -280,6 +391,7 @@ async def handle_text(message: types.Message):
 async def _do_generate_text(message: types.Message, model: dict, prompt: str):
     status_msg = await message.answer(f"Generando imagen con {model['name']}...")
 
+    backend = "xAI" if model.get("provider") == "xai" else "Replicate"
     try:
         output, err = await generate_image(model, prompt)
         if err:
@@ -287,7 +399,7 @@ async def _do_generate_text(message: types.Message, model: dict, prompt: str):
             return
         await process_image_result(output, prompt, status_msg, message, "Prompt")
     except replicate.exceptions.ReplicateError as e:
-        await status_msg.edit_text(f"Error de Replicate: {e}")
+        await status_msg.edit_text(f"Error de {backend}: {e}")
     except Exception as e:
         await status_msg.edit_text(f"Error inesperado: {e}")
 
@@ -309,6 +421,7 @@ async def handle_photo_caption(message: types.Message):
     model = get_model(message.from_user.id)
     status_msg = await message.answer(f"Editando imagen con {model['name']}...")
 
+    backend = "xAI" if model.get("provider") == "xai" else "Replicate"
     try:
         file = await bot.get_file(message.photo[-1].file_id)
         file_bytes = await bot.download_file(file.file_path)
@@ -322,7 +435,7 @@ async def handle_photo_caption(message: types.Message):
             return
         await process_image_result(output, prompt, status_msg, message, "Edit")
     except replicate.exceptions.ReplicateError as e:
-        await status_msg.edit_text(f"Error de Replicate: {e}")
+        await status_msg.edit_text(f"Error de {backend}: {e}")
     except Exception as e:
         await status_msg.edit_text(f"Error inesperado: {e}")
 
@@ -369,6 +482,7 @@ async def handle_reply_edit(message: types.Message):
     model = get_model(message.from_user.id)
     status_msg = await message.answer(f"Editando imagen con {model['name']}...")
 
+    backend = "xAI" if model.get("provider") == "xai" else "Replicate"
     try:
         replied_photo = message.reply_to_message.photo[-1]
         file = await bot.get_file(replied_photo.file_id)
@@ -383,7 +497,7 @@ async def handle_reply_edit(message: types.Message):
             return
         await process_image_result(output, prompt, status_msg, message, "Edit")
     except replicate.exceptions.ReplicateError as e:
-        await status_msg.edit_text(f"Error de Replicate: {e}")
+        await status_msg.edit_text(f"Error de {backend}: {e}")
     except Exception as e:
         await status_msg.edit_text(f"Error inesperado: {e}")
 
@@ -612,7 +726,10 @@ def _process_batch_replicate_sync(source_path: str, input_dir: Path, output_dir:
 # Image generation / editing (grok / seedream)
 # ---------------------------------------------------------------------------
 async def generate_image(model: dict, prompt: str, image_data: BytesIO | None = None) -> tuple[object | None, str | None]:
-    if model.get("provider") == "xai":
+    prov = model.get("provider", "?")
+    model_id = model.get("id")
+    print(f"[generate] key={model.get('key')} provider={prov} id={model_id} has_image={image_data is not None}")
+    if prov == "xai":
         return await _generate_xai(model, prompt, image_data)
     return await _generate_replicate(model, prompt, image_data)
 
