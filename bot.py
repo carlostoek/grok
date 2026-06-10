@@ -31,10 +31,11 @@ SOURCES_DIR = Path(__file__).parent / "sources"
 MODELS = {
     "grok": {
         "key": "grok",
-        "id": "grok-imagine-image-quality",           # used for xAI direct API
-        "replicate_id": "xai/grok-imagine-image-quality",  # full ref required by Replicate (from original implementation)
+        # Base identifiers (variant-specific id/replicate_id resolved at runtime via get_grok_imagine_config + get_model)
+        "id": "grok-imagine-image-quality",           # default/fallback (xAI direct)
+        "replicate_id": "xai/grok-imagine-image-quality",
         "name": "Grok Imagine",
-        "desc": "xAI Grok Imagine (2K)",
+        "desc": "xAI Grok Imagine",
         "provider": "xai",
     },
     "seedream": {
@@ -52,59 +53,97 @@ MODELS = {
         "provider": "replicate",
     },
 }
-DEFAULT_MODEL = "grok"
-DEFAULT_GROK_PROVIDER = "xai"
 
-GROK_PROVIDERS = {
-    "xai": {
-        "key": "xai",
-        "name": "xAI",
-        "desc": "API oficial de xAI para Grok Imagine",
+DEFAULT_MODEL = "grok"
+
+# Granular Grok Imagine configuration (independent, persistent flow).
+# Two providers (xAI direct / Replicate) × two quality tiers.
+# Research-backed identifiers (xAI API + Replicate xai/ mirrors):
+#   - standard: fast, grok-imagine-image / xai/grok-imagine-image
+#   - quality : higher fidelity, better text/detail/2K, grok-imagine-image-quality / xai/grok-imagine-image-quality
+GROK_IMAGINE_VARIANTS = {
+    "standard": {
+        "id": "grok-imagine-image",
+        "replicate_id": "xai/grok-imagine-image",
+        "label": "Estándar",
+        "desc": "Rápido, ideal para prototipado y previews",
     },
-    "replicate": {
-        "key": "replicate",
-        "name": "Replicate",
-        "desc": "Grok Imagine a trav\u00e9s de Replicate",
+    "quality": {
+        "id": "grok-imagine-image-quality",
+        "replicate_id": "xai/grok-imagine-image-quality",
+        "label": "Alta calidad",
+        "desc": "Mayor detalle, texto nítido, hasta 2K (recomendado para finales)",
     },
 }
+DEFAULT_GROK_IMAGINE_PROVIDER = "xai"
+DEFAULT_GROK_IMAGINE_VARIANT = "quality"
 
-# Per-user state: user_id -> {model, grok_provider, source_path, fs_state, pending_prompt}
+# (GROK_PROVIDERS removed — replaced by the granular GROK_IMAGINE_VARIANTS + independent /imagine flow)
+
+# Per-user in-memory cache (hydrated from sessions.py persistence on first access).
+# Keys: model (top-level), grok_imagine_provider + grok_imagine_variant (granular Imagine config),
+#       source_path, fs_state, pending_prompt.
+# The Grok Imagine detailed config (provider + variant) lives in its own independent
+# persistent flow (/imagine) and is completely decoupled from the /model top-level selector.
 user_state: dict[int, dict] = {}
 
 
 def get_user_state(user_id: int) -> dict:
     if user_id not in user_state:
+        # Hydrate from disk persistence (sessions.py now stores model + imagine granular config)
+        persisted = sessions.get_session(user_id)
         user_state[user_id] = {
-            "model": DEFAULT_MODEL,
-            "grok_provider": DEFAULT_GROK_PROVIDER,
-            "source_path": None,
-            "fs_state": sessions.FsState.IDLE,
+            "model": persisted.get("model", sessions.DEFAULT_MODEL),
+            "grok_imagine_provider": persisted.get("grok_imagine_provider", sessions.DEFAULT_GROK_IMAGINE_PROVIDER),
+            "grok_imagine_variant": persisted.get("grok_imagine_variant", sessions.DEFAULT_GROK_IMAGINE_VARIANT),
+            "source_path": persisted.get("source_path"),
+            "fs_state": persisted.get("state", sessions.FsState.IDLE),
             "pending_prompt": None,
         }
     return user_state[user_id]
 
 
-def get_grok_provider(user_id: int) -> str:
+def get_grok_imagine_config(user_id: int) -> dict:
+    """Return the current granular (provider + variant) config for Grok Imagine.
+    This is the source of truth for the independent persistent Imagine settings.
+    Falls back to module defaults (which match the ones in sessions).
+    """
     state = get_user_state(user_id)
-    return state.get("grok_provider", DEFAULT_GROK_PROVIDER)
+    prov = state.get("grok_imagine_provider", sessions.DEFAULT_GROK_IMAGINE_PROVIDER)
+    var = state.get("grok_imagine_variant", sessions.DEFAULT_GROK_IMAGINE_VARIANT)
+    if prov not in ("xai", "replicate"):
+        prov = sessions.DEFAULT_GROK_IMAGINE_PROVIDER
+    if var not in GROK_IMAGINE_VARIANTS:
+        var = sessions.DEFAULT_GROK_IMAGINE_VARIANT
+    spec = GROK_IMAGINE_VARIANTS[var]
+    return {
+        "provider": prov,
+        "variant": var,
+        "id": spec["replicate_id"] if prov == "replicate" else spec["id"],
+        "label": spec["label"],
+        "desc": spec["desc"],
+        "prov_label": "xAI" if prov == "xai" else "Replicate",
+    }
 
 
 def get_model(user_id: int) -> dict:
+    """Return a concrete model dict for generation (and for display in UI).
+    For the 'grok' (Grok Imagine) key the dict is dynamically built from the
+    independent granular config (provider + standard/quality variant).
+    Non-grok models are returned as-is from the static registry.
+    """
     key = get_user_state(user_id)["model"]
     base = MODELS.get(key, MODELS[DEFAULT_MODEL])
     if key == "grok":
         m = dict(base)
-        prov = get_grok_provider(user_id)
-        m["provider"] = prov
-        # Use the correct model identifier for the chosen backend.
-        # xAI direct uses the short name; Replicate requires the full "owner/name" reference.
-        if prov == "replicate":
-            m["id"] = base.get("replicate_id", "xai/grok-imagine-image-quality")
-        else:
-            m["id"] = base.get("id", "grok-imagine-image-quality")
-        prov_label = "xAI" if prov == "xai" else "Replicate"
-        m["name"] = f"Grok Imagine ({prov_label})"
-        m["desc"] = f"xAI Grok Imagine (2K) v\u00eda {prov_label}"
+        cfg = get_grok_imagine_config(user_id)
+        m["provider"] = cfg["provider"]
+        m["id"] = cfg["id"]  # already resolved to short (xAI) or full (Replicate)
+        m["name"] = f"Grok Imagine ({cfg['prov_label']} • {cfg['label']})"
+        m["desc"] = f"xAI Grok Imagine — {cfg['prov_label']} • {cfg['label']}: {cfg['desc']}"
+        # keep a couple of extra fields for convenience in status messages
+        m["imagine_provider"] = cfg["provider"]
+        m["imagine_variant"] = cfg["variant"]
         return m
     return base
 
@@ -113,15 +152,18 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 
-# --- Model selection keyboard ---
+# --- Model selection keyboard (top-level only: Grok / Seedream / FaceSwap) ---
+# The detailed Grok Imagine settings (provider + variant) are shown in the label
+# but changed via the independent /imagine flow (not here).
 def model_keyboard(user_id: int) -> InlineKeyboardMarkup:
     state = get_user_state(user_id)
     current_key = state["model"]
-    grok_prov = state.get("grok_provider", DEFAULT_GROK_PROVIDER)
     buttons = []
     for key, m in MODELS.items():
         if key == "grok":
-            suffix = "xAI" if grok_prov == "xai" else "Replicate"
+            # Use the separate persistent imagine config for the rich label
+            cfg = get_grok_imagine_config(user_id)
+            suffix = f"{cfg['prov_label']} • {cfg['label']}"
             label = f"{'✅ ' if key == current_key else ''}Grok Imagine ({suffix})"
         else:
             label = f"{'✅ ' if key == current_key else ''}{m['name']}"
@@ -129,19 +171,7 @@ def model_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def grok_provider_keyboard(current_prov: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if current_prov == 'xai' else ''}xAI (oficial)",
-            callback_data="grokprov:xai"
-        )],
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if current_prov == 'replicate' else ''}Replicate",
-            callback_data="grokprov:replicate"
-        )],
-        [InlineKeyboardButton(text="← Volver a modelos", callback_data="model:back")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+# (Old single-provider keyboard + handler fully removed. Granular Imagine config is exclusively in the /imagine dedicated flow.)
 
 
 # ---------------------------------------------------------------------------
@@ -193,20 +223,36 @@ async def handle_model_selection(callback: types.CallbackQuery):
         await callback.answer("Modelo no disponible.", show_alert=True)
         return
 
+    state = get_user_state(callback.from_user.id)
+
     if model_key == "grok":
-        # Ask for provider choice instead of direct switch
-        current_prov = get_grok_provider(callback.from_user.id)
+        # Grok Imagine selected. We do NOT prompt for provider/variant here anymore.
+        # The detailed settings live in a completely independent persistent flow (/imagine).
+        # We just activate the top-level mode; display will use the saved granular config.
+        state["model"] = "grok"
+        # Also persist the top-level choice
+        sessions.set_model(callback.from_user.id, "grok")
+
+        model = get_model(callback.from_user.id)
+        lines = [
+            f"Modo <b>{model['name']}</b> activado.\n",
+            f"<i>{model['desc']}</i>\n",
+            "Usa /imagine para configurar proveedor (xAI/Replicate) y nivel de calidad (Estándar/Alta calidad).",
+            "Esa configuración es persistente e independiente del selector de modelos.",
+            "",
+            "Enviame un prompt (o foto + caption para editar).",
+        ]
         await callback.message.edit_text(
-            "Grok Imagine seleccionado.\n\nElige con qu\u00e9 API/proveedor quieres trabajar:",
+            "\n".join(lines),
             parse_mode="HTML",
-            reply_markup=grok_provider_keyboard(current_prov),
+            reply_markup=model_keyboard(callback.from_user.id),
         )
-        await callback.answer()
+        await callback.answer(f"Modelo: {model['name']}")
         return
 
-    # Non-grok models: direct switch
-    state = get_user_state(callback.from_user.id)
+    # Non-grok models: direct switch (unchanged behavior)
     state["model"] = model_key
+    sessions.set_model(callback.from_user.id, model_key)  # persist top-level choice
     model = MODELS[model_key]
 
     lines = [
@@ -229,35 +275,9 @@ async def handle_model_selection(callback: types.CallbackQuery):
     await callback.answer(f"Modelo: {model['name']}")
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("grokprov:"))
-async def handle_grok_provider(callback: types.CallbackQuery):
-    prov = callback.data.split(":", 1)[1]
-    if prov not in GROK_PROVIDERS:
-        await callback.answer("Proveedor no disponible.", show_alert=True)
-        return
-
-    state = get_user_state(callback.from_user.id)
-    state["model"] = "grok"
-    state["grok_provider"] = prov
-
-    model = get_model(callback.from_user.id)
-    prov_info = GROK_PROVIDERS[prov]
-
-    lines = [
-        f"Modelo cambiado a <b>{model['name']}</b>.\n",
-        f"Proveedor: <b>{prov_info['name']}</b>\n",
-        f"<i>{prov_info['desc']}</i>\n",
-        "Enviame un prompt para generar una imagen.",
-        "O envia una foto con caption para editarla.",
-    ]
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=model_keyboard(callback.from_user.id),
-    )
-    await callback.answer(f"Proveedor: {prov_info['name']}")
-
+# Old grokprov: handler removed.
+# Provider + variant selection for Grok Imagine is now exclusively in the
+# independent /imagine command (grokcfg: callbacks below).
 
 @dp.callback_query(lambda c: c.data == "model:back")
 async def handle_model_back(callback: types.CallbackQuery):
@@ -265,6 +285,110 @@ async def handle_model_back(callback: types.CallbackQuery):
         "Selecciona el modelo:",
         reply_markup=model_keyboard(callback.from_user.id),
     )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# /imagine  — independent, persistent granular config for Grok Imagine only
+# (provider x variant). Completely separate from the /model top-level selector.
+# ---------------------------------------------------------------------------
+def imagine_config_keyboard(current_prov: str, current_var: str) -> InlineKeyboardMarkup:
+    """4-option keyboard for the dedicated Grok Imagine settings.
+    Shows checkmarks for the active combination. Selection is immediate + persistent.
+    """
+    def mk(prov: str, var: str, text: str) -> InlineKeyboardButton:
+        is_current = (prov == current_prov and var == current_var)
+        prefix = "✅ " if is_current else ""
+        return InlineKeyboardButton(
+            text=f"{prefix}{text}",
+            callback_data=f"grokcfg:{prov}:{var}",
+        )
+
+    buttons = [
+        [mk("xai", "quality", "xAI (oficial) • Alta calidad")],
+        [mk("xai", "standard", "xAI (oficial) • Estándar")],
+        [mk("replicate", "quality", "Replicate • Alta calidad")],
+        [mk("replicate", "standard", "Replicate • Estándar")],
+        [InlineKeyboardButton(text="← Cerrar", callback_data="imagine:close")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("imagine"))
+async def cmd_imagine(message: types.Message):
+    """Entry point to the separate persistent configuration for Grok Imagine.
+    This flow manages provider (xAI vs Replicate) + quality tier and is
+    remembered until the user makes an explicit change.
+    """
+    uid = message.from_user.id
+    cfg = get_grok_imagine_config(uid)
+    state = get_user_state(uid)
+    # Ensure top-level is at least aware (optional nicety)
+    if state.get("model") != "grok":
+        # We don't force-switch the top model; user can do /model if they want.
+        pass
+
+    current_text = f"<b>{cfg['prov_label']} • {cfg['label']}</b>"
+
+    text = (
+        "Configuración de <b>Grok Imagine</b> (persistente e independiente).\n\n"
+        f"Actual: {current_text}\n"
+        f"<i>{cfg['desc']}</i>\n\n"
+        "Elige combinación de proveedor y nivel de calidad. El cambio se guarda inmediatamente "
+        "y se usará la próxima vez que actives Grok Imagine (vía /model o generación)."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=imagine_config_keyboard(cfg["provider"], cfg["variant"]))
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("grokcfg:"))
+async def handle_grok_imagine_config(callback: types.CallbackQuery):
+    """Handle selection from the independent /imagine config keyboard.
+    Persists via sessions.set_grok_imagine_config and updates runtime state + UI.
+    """
+    try:
+        _, prov, var = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("Opción inválida.", show_alert=True)
+        return
+
+    if prov not in ("xai", "replicate") or var not in GROK_IMAGINE_VARIANTS:
+        await callback.answer("Configuración no disponible.", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    state = get_user_state(uid)
+
+    # Update runtime cache
+    state["grok_imagine_provider"] = prov
+    state["grok_imagine_variant"] = var
+
+    # Persist (the key part of the requirement)
+    sessions.set_grok_imagine_config(uid, prov, var)
+
+    # Also make sure top-level model points to grok (convenience, not required)
+    state["model"] = "grok"
+    sessions.set_model(uid, "grok")
+
+    cfg = get_grok_imagine_config(uid)
+    model = get_model(uid)
+
+    text = (
+        "✅ Configuración de Grok Imagine actualizada y guardada.\n\n"
+        f"Actual: <b>{cfg['prov_label']} • {cfg['label']}</b>\n"
+        f"<i>{cfg['desc']}</i>\n\n"
+        "Esta configuración es persistente. Se usará siempre que el modo Grok Imagine esté activo."
+    )
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=imagine_config_keyboard(prov, var),
+    )
+    await callback.answer(f"Grok Imagine: {cfg['prov_label']} • {cfg['label']}")
+
+
+@dp.callback_query(lambda c: c.data == "imagine:close")
+async def handle_imagine_close(callback: types.CallbackQuery):
+    await callback.message.edit_text("Configuración de Grok Imagine cerrada.")
     await callback.answer()
 
 
@@ -336,8 +460,11 @@ async def cmd_estado(message: types.Message):
         lines.append(f"Estado: {state['fs_state']}")
     else:
         if model.get("key") == "grok":
-            backend = "xAI (oficial)" if model.get("provider") == "xai" else "Replicate"
-            lines.append(f"API / Backend: {backend}\n")
+            prov = model.get("imagine_provider") or model.get("provider", "?")
+            var = model.get("imagine_variant", "?")
+            var_label = GROK_IMAGINE_VARIANTS.get(var, {}).get("label", var)
+            prov_label = "xAI (oficial)" if prov == "xai" else "Replicate"
+            lines.append(f"API / Backend: {prov_label} • {var_label}\n")
         lines.append("Listo para generar/editar imagenes.")
 
     await message.answer("\n".join(lines))

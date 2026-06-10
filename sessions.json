@@ -1,7 +1,10 @@
 {
   "6181290784": {
     "source_path": "/home/ubuntu/repos/grok/sources/6181290784.jpg",
-    "state": "IDLE"
+    "state": "IDLE",
+    "model": "grok",
+    "grok_imagine_provider": "xai",
+    "grok_imagine_variant": "quality"
   },
   "1280444712": {
     "source_path": "/home/ubuntu/repos/grok/sources/1280444712.jpg",
