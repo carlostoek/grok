@@ -233,7 +233,8 @@ async def test_post_body_t2v_uses_session_config(no_sleep, sessions_file):
 
 
 @pytest.mark.asyncio
-async def test_post_body_i2v_uses_image_model_and_payload(no_sleep):
+async def test_post_body_i2v_uses_persisted_model_and_payload(no_sleep, sessions_file):
+    sessions.set_video_config(88, model="grok-imagine-video-1.5")
     captured: dict = {}
     image_bytes = b"fake-jpeg-data"
 
@@ -324,6 +325,20 @@ async def test_poll_network_error_retries(no_sleep):
         mocked.get(POLL_URL, exception=aiohttp.ClientError("timeout"))
         mocked.get(POLL_URL, payload=_done_payload())
         url, err = await bot._generate_xai_video(MODEL, "prompt")
+
+    assert err is None
+    assert url == VIDEO_URL
+
+
+@pytest.mark.asyncio
+async def test_poll_http_202_accepted_continues_until_done(no_sleep, sessions_file):
+    """xAI returns HTTP 202 on poll while the video is still processing."""
+    with aioresponses() as mocked:
+        mocked.post(GEN_URL, status=202, payload={"request_id": "req-1"})
+        mocked.get(POLL_URL, status=202, payload={"status": "pending"})
+        mocked.get(POLL_URL, status=202, payload={"status": "processing"})
+        mocked.get(POLL_URL, status=200, payload=_done_payload())
+        url, err = await bot._generate_xai_video(MODEL, "prompt", user_id=42)
 
     assert err is None
     assert url == VIDEO_URL

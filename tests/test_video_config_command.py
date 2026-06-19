@@ -108,6 +108,36 @@ async def test_videocfg_resolution_persists(sessions_file, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_videocfg_model_persists(sessions_file, monkeypatch):
+    uid = 9001
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "videocfg:model:grok-imagine-video-1.5"
+    callback.message = MagicMock()
+    callback.message.edit_text = AsyncMock()
+    callback.answer = AsyncMock()
+
+    await bot.handle_video_config(callback)
+
+    cfg = sessions.get_video_config(uid)
+    assert cfg["model"] == "grok-imagine-video-1.5"
+
+
+async def test_videocfg_guard_same_model(sessions_file, monkeypatch):
+    uid = 9002
+    sessions.set_video_config(uid, model="grok-imagine-video")
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "videocfg:model:grok-imagine-video"
+    callback.message = MagicMock()
+    callback.answer = AsyncMock()
+
+    await bot.handle_video_config(callback)
+
+    callback.answer.assert_awaited_once()
+    assert "activo" in callback.answer.await_args.args[0].lower()
+
+
 async def test_videocfg_guard_same_resolution(sessions_file, monkeypatch):
     uid = 7007
     sessions.set_video_config(uid, resolution="720p")

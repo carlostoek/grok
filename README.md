@@ -19,7 +19,7 @@ Select **Grok Imagine Video** via `/model`, then:
 
 Defaults: 5s duration, 16:9 aspect ratio, 720p resolution (persisted per user in `sessions.json`).
 
-Use `/video` to change duration (5/10/15s), aspect ratio, and resolution (480p/720p).
+Use `/video` to change the xAI model (`grok-imagine-video` base or `grok-imagine-video-1.5` recent), duration (5/10/15s), aspect ratio, and resolution (480p/720p).
 
 ## Environment variables
 

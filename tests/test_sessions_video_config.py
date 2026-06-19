@@ -9,11 +9,35 @@ import sessions
 
 def test_get_video_config_defaults(sessions_file):
     cfg = sessions.get_video_config(999)
+    assert cfg["model"] == sessions.DEFAULT_VIDEO_MODEL
     assert cfg == {
         "duration": 5,
         "aspect_ratio": "16:9",
         "resolution": "720p",
+        "model": sessions.DEFAULT_VIDEO_MODEL,
     }
+
+
+def test_get_video_config_invalid_model_falls_back(sessions_file):
+    sessions_file.write_text(
+        json.dumps(
+            {
+                "999": {
+                    "video_duration": 5,
+                    "video_aspect_ratio": "16:9",
+                    "video_resolution": "720p",
+                    "video_model": "grok-imagine-video-99",
+                }
+            }
+        )
+    )
+    cfg = sessions.get_video_config(999)
+    assert cfg["model"] == sessions.DEFAULT_VIDEO_MODEL
+
+
+def test_set_video_config_persists_model(sessions_file):
+    sessions.set_video_config(777, model="grok-imagine-video-1.5")
+    assert sessions.get_video_config(777)["model"] == "grok-imagine-video-1.5"
 
 
 def test_get_video_config_invalid_duration_falls_back(sessions_file):
@@ -66,12 +90,18 @@ def test_ensure_full_migrates_missing_video_fields(sessions_file):
     assert rec["video_duration"] == sessions.DEFAULT_VIDEO_DURATION
     assert rec["video_aspect_ratio"] == sessions.DEFAULT_VIDEO_ASPECT_RATIO
     assert rec["video_resolution"] == sessions.DEFAULT_VIDEO_RESOLUTION
+    assert rec["video_model"] == sessions.DEFAULT_VIDEO_MODEL
 
 
 def test_set_video_config_persists_fields(sessions_file):
     sessions.set_video_config(555, duration=15, aspect_ratio="3:2", resolution="480p")
     cfg = sessions.get_video_config(555)
-    assert cfg == {"duration": 15, "aspect_ratio": "3:2", "resolution": "480p"}
+    assert cfg == {
+        "duration": 15,
+        "aspect_ratio": "3:2",
+        "resolution": "480p",
+        "model": sessions.DEFAULT_VIDEO_MODEL,
+    }
 
 
 def test_record_video_hourly_usage_persists(sessions_file):

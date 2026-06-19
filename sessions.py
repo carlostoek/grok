@@ -21,9 +21,11 @@ DEFAULT_GROK_IMAGINE_VARIANT = "quality"
 DEFAULT_VIDEO_DURATION = 5
 DEFAULT_VIDEO_ASPECT_RATIO = "16:9"
 DEFAULT_VIDEO_RESOLUTION = "720p"
+DEFAULT_VIDEO_MODEL = "grok-imagine-video"
 VALID_VIDEO_DURATIONS = (5, 10, 15)
 VALID_VIDEO_ASPECT_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3")
 VALID_VIDEO_RESOLUTIONS = ("480p", "720p")
+VALID_VIDEO_MODELS = ("grok-imagine-video", "grok-imagine-video-1.5")
 VIDEO_HOURLY_WINDOW_SEC = 3600
 
 
@@ -38,6 +40,7 @@ def _default_session_record(**overrides) -> dict:
         "video_duration": DEFAULT_VIDEO_DURATION,
         "video_aspect_ratio": DEFAULT_VIDEO_ASPECT_RATIO,
         "video_resolution": DEFAULT_VIDEO_RESOLUTION,
+        "video_model": DEFAULT_VIDEO_MODEL,
         "video_hourly_timestamps": [],
     }
     rec.update(overrides)
@@ -89,6 +92,9 @@ def _ensure_full(rec: dict) -> bool:
         changed = True
     if "video_hourly_timestamps" not in rec:
         rec["video_hourly_timestamps"] = []
+        changed = True
+    if "video_model" not in rec:
+        rec["video_model"] = DEFAULT_VIDEO_MODEL
         changed = True
     return changed
 
@@ -149,6 +155,7 @@ def set_source(user_id: int, source_path: str) -> None:
         "video_duration": current.get("video_duration", DEFAULT_VIDEO_DURATION),
         "video_aspect_ratio": current.get("video_aspect_ratio", DEFAULT_VIDEO_ASPECT_RATIO),
         "video_resolution": current.get("video_resolution", DEFAULT_VIDEO_RESOLUTION),
+        "video_model": current.get("video_model", DEFAULT_VIDEO_MODEL),
         "video_hourly_timestamps": current.get("video_hourly_timestamps", []),
     }
     _save(sessions)
@@ -203,10 +210,15 @@ def get_video_config(user_id: int) -> dict:
     if resolution not in VALID_VIDEO_RESOLUTIONS:
         resolution = DEFAULT_VIDEO_RESOLUTION
 
+    video_model = rec.get("video_model", DEFAULT_VIDEO_MODEL)
+    if video_model not in VALID_VIDEO_MODELS:
+        video_model = DEFAULT_VIDEO_MODEL
+
     return {
         "duration": duration,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
+        "model": video_model,
     }
 
 
@@ -262,8 +274,9 @@ def set_video_config(
     duration: int | None = None,
     aspect_ratio: str | None = None,
     resolution: str | None = None,
+    model: str | None = None,
 ) -> None:
-    """Persist video generation settings (duration, aspect ratio, resolution)."""
+    """Persist video generation settings (duration, aspect ratio, resolution, model)."""
     uid = str(user_id)
     sessions_data = _load()
     if uid not in sessions_data:
@@ -279,6 +292,9 @@ def set_video_config(
     if resolution is not None:
         if resolution in VALID_VIDEO_RESOLUTIONS:
             rec["video_resolution"] = resolution
+    if model is not None:
+        if model in VALID_VIDEO_MODELS:
+            rec["video_model"] = model
     sessions_data[uid] = rec
     _save(sessions_data)
 

@@ -80,11 +80,15 @@ MODELS = {
     "grok_video": {
         "key": "grok_video",
         "id": "grok-imagine-video",
-        "id_image_to_video": "grok-imagine-video-1.5",
         "name": "Grok Imagine Video",
         "desc": "Generación de video con xAI Grok Imagine",
         "provider": "xai",
     },
+}
+
+VIDEO_MODEL_LABELS = {
+    "grok-imagine-video": "Base",
+    "grok-imagine-video-1.5": "1.5 (reciente)",
 }
 
 DEFAULT_MODEL = "grok"
@@ -145,6 +149,22 @@ def _escape_prompt(prompt: str) -> str:
     return html.escape(prompt)
 
 
+def _video_status_message(model_id: str, detail: str, prompt: str) -> str:
+    """Video generation status line with model id in bold (HTML parse_mode)."""
+    return (
+        f"Generando video con <b>{html.escape(model_id)}</b>... {detail}\n\n"
+        f"<i>{_escape_prompt(prompt)}</i>"
+    )
+
+
+def _video_start_message(model_id: str, prompt: str) -> str:
+    """Initial video generation message before polling updates (HTML parse_mode)."""
+    return (
+        f"Generando video con <b>{html.escape(model_id)}</b>...\n\n"
+        f"<i>{_escape_prompt(prompt)}</i>"
+    )
+
+
 def _xai_user_error(context: str = "generación") -> str:
     return f"Error en la {context}. Intenta de nuevo más tarde."
 
@@ -152,6 +172,11 @@ def _xai_user_error(context: str = "generación") -> str:
 def _log_xai_error(status: int, request_id: str | None = None) -> None:
     suffix = f" request_id={request_id}" if request_id else ""
     print(f"[xAI error] status={status}{suffix}")
+
+
+def _xai_http_ok(status: int) -> bool:
+    """xAI video endpoints may return 200 or 202 (Accepted) while async work is in flight."""
+    return status in (200, 202)
 
 
 def _is_user_allowed(user_id: int) -> bool:
@@ -656,6 +681,14 @@ async def handle_imagine_close(callback: types.CallbackQuery):
 # /video  — independent, persistent config for Grok Imagine Video
 # ---------------------------------------------------------------------------
 def video_config_keyboard(current: dict) -> InlineKeyboardMarkup:
+    def model_btn(model_id: str) -> InlineKeyboardButton:
+        prefix = "✅ " if model_id == current["model"] else ""
+        label = VIDEO_MODEL_LABELS.get(model_id, model_id)
+        return InlineKeyboardButton(
+            text=f"{prefix}{label}",
+            callback_data=f"videocfg:model:{model_id}",
+        )
+
     def dur_btn(value: int) -> InlineKeyboardButton:
         prefix = "✅ " if value == current["duration"] else ""
         return InlineKeyboardButton(
@@ -678,6 +711,7 @@ def video_config_keyboard(current: dict) -> InlineKeyboardMarkup:
         )
 
     buttons = [
+        [model_btn("grok-imagine-video"), model_btn("grok-imagine-video-1.5")],
         [dur_btn(5), dur_btn(10), dur_btn(15)],
         [aspect_btn("16:9"), aspect_btn("9:16"), aspect_btn("1:1")],
         [aspect_btn("4:3"), aspect_btn("3:4"), aspect_btn("3:2"), aspect_btn("2:3")],
@@ -690,10 +724,11 @@ def video_config_keyboard(current: dict) -> InlineKeyboardMarkup:
 @dp.message(Command("video"))
 async def cmd_video(message: types.Message):
     cfg = sessions.get_video_config(message.from_user.id)
+    model_label = VIDEO_MODEL_LABELS.get(cfg["model"], cfg["model"])
     text = (
         "Configuración de <b>Grok Imagine Video</b> (persistente).\n\n"
-        f"Actual: <b>{cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}</b>\n\n"
-        "Elige duración, relación de aspecto y resolución. El cambio se guarda inmediatamente."
+        f"Actual: <b>{model_label}</b> • {cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}\n\n"
+        "Elige modelo, duración, relación de aspecto y resolución. El cambio se guarda inmediatamente."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=video_config_keyboard(cfg))
 
@@ -709,7 +744,15 @@ async def handle_video_config(callback: types.CallbackQuery):
     uid = callback.from_user.id
     prior = sessions.get_video_config(uid)
 
-    if field == "duration":
+    if field == "model":
+        if value not in sessions.VALID_VIDEO_MODELS:
+            await callback.answer("Modelo no disponible.", show_alert=True)
+            return
+        if value == prior["model"]:
+            await callback.answer("Ya está activo ese modelo.")
+            return
+        sessions.set_video_config(uid, model=value)
+    elif field == "duration":
         try:
             duration = int(value)
         except ValueError:
@@ -740,9 +783,10 @@ async def handle_video_config(callback: types.CallbackQuery):
         return
 
     cfg = sessions.get_video_config(uid)
+    model_label = VIDEO_MODEL_LABELS.get(cfg["model"], cfg["model"])
     text = (
         "✅ Configuración de video actualizada y guardada.\n\n"
-        f"Actual: <b>{cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}</b>\n\n"
+        f"Actual: <b>{model_label}</b> • {cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}\n\n"
         "Esta configuración es persistente para el modo Grok Imagine Video."
     )
     await safe_edit_text(
@@ -751,7 +795,9 @@ async def handle_video_config(callback: types.CallbackQuery):
         parse_mode="HTML",
         reply_markup=video_config_keyboard(cfg),
     )
-    await callback.answer(f"Video: {cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}")
+    await callback.answer(
+        f"Video: {model_label} • {cfg['duration']}s • {cfg['aspect_ratio']} • {cfg['resolution']}"
+    )
 
 
 @dp.callback_query(lambda c: c.data == "video:close")
@@ -782,9 +828,10 @@ async def handle_confirm_generation(callback: types.CallbackQuery):
     model = get_model(callback.from_user.id)
     safe_prompt = _escape_prompt(prompt)
     if model["key"] == "grok_video":
+        video_model = sessions.get_video_config(callback.from_user.id)["model"]
         await safe_edit_text(
             callback.message,
-            f"Generando video con {model['name']}...\n\n<i>{safe_prompt}</i>",
+            _video_start_message(video_model, prompt),
             parse_mode="HTML",
             reply_markup=None,
         )
@@ -855,11 +902,13 @@ async def cmd_estado(message: types.Message):
         elif model.get("key") == "grok_video":
             video_cfg = sessions.get_video_config(message.from_user.id)
             lines.append("API / Backend: xAI (oficial)\n")
+            model_label = VIDEO_MODEL_LABELS.get(video_cfg["model"], video_cfg["model"])
             lines.append(
-                f"Video: {video_cfg['duration']}s, {video_cfg['aspect_ratio']}, {video_cfg['resolution']}\n"
+                f"Video: {model_label}, {video_cfg['duration']}s, "
+                f"{video_cfg['aspect_ratio']}, {video_cfg['resolution']}\n"
             )
             lines.append("Listo para generar videos (texto o imagen a video).")
-            lines.append("Usa /video para configurar duración, aspecto y resolución.")
+            lines.append("Usa /video para configurar modelo, duración, aspecto y resolución.")
         else:
             lines.append("Listo para generar/editar imagenes.")
 
@@ -975,8 +1024,15 @@ async def _do_generate_video(
                 return
 
         if status_msg is None:
-            action = "Animando imagen" if image_data else "Generando video"
-            status_msg = await reply_msg.answer(f"{action} con {model['name']}...")
+            video_model = sessions.get_video_config(uid)["model"]
+            if image_data:
+                status_text = (
+                    f"Animando imagen con <b>{html.escape(video_model)}</b>...\n\n"
+                    f"<i>{_escape_prompt(prompt)}</i>"
+                )
+            else:
+                status_text = _video_start_message(video_model, prompt)
+            status_msg = await reply_msg.answer(status_text, parse_mode="HTML")
 
         output, err = await generate_video(
             model,
@@ -1502,7 +1558,10 @@ async def generate_video(
     user_id: int | None = None,
 ) -> tuple[str | None, str | None]:
     prov = model.get("provider", "?")
-    model_id = model.get("id")
+    if user_id is not None:
+        model_id = sessions.get_video_config(user_id)["model"]
+    else:
+        model_id = sessions.DEFAULT_VIDEO_MODEL
     print(
         f"[generate_video] key={model.get('key')} provider={prov} id={model_id} "
         f"has_image={image_data is not None}"
@@ -1535,9 +1594,10 @@ async def _generate_xai_video(
         "duration": sessions.DEFAULT_VIDEO_DURATION,
         "aspect_ratio": sessions.DEFAULT_VIDEO_ASPECT_RATIO,
         "resolution": sessions.DEFAULT_VIDEO_RESOLUTION,
+        "model": sessions.DEFAULT_VIDEO_MODEL,
     }
 
-    model_id = model["id_image_to_video"] if image_data else model["id"]
+    model_id = video_cfg["model"]
     body: dict = {
         "model": model_id,
         "prompt": prompt,
@@ -1558,7 +1618,7 @@ async def _generate_xai_video(
             headers=headers,
             json=body,
         ) as resp:
-            if resp.status != 200:
+            if not _xai_http_ok(resp.status):
                 await resp.text()
                 _log_xai_error(resp.status)
                 return None, _xai_user_error("generación de video")
@@ -1605,7 +1665,7 @@ async def _generate_xai_video(
                     label = _VIDEO_STATUS_LABELS[status]
                     await safe_edit_text(
                         status_msg,
-                        f"Generando video... {label}\n\n<i>{_escape_prompt(prompt)}</i>",
+                        _video_status_message(model_id, label, prompt),
                         parse_mode="HTML",
                     )
                     last_status = status
@@ -1615,7 +1675,7 @@ async def _generate_xai_video(
                     if elapsed - last_elapsed_shown >= 30:
                         await safe_edit_text(
                             status_msg,
-                            f"Generando video... ({elapsed}s transcurridos)\n\n<i>{_escape_prompt(prompt)}</i>",
+                            _video_status_message(model_id, f"({elapsed}s transcurridos)", prompt),
                             parse_mode="HTML",
                         )
                         last_elapsed_shown = elapsed
@@ -1642,7 +1702,7 @@ async def _poll_video_once(
                     await poll_resp.text()
                     _log_xai_error(poll_resp.status, request_id)
                     return None, _xai_user_error("consulta de video")
-                if poll_resp.status != 200:
+                if not _xai_http_ok(poll_resp.status):
                     await poll_resp.text()
                     _log_xai_error(poll_resp.status, request_id)
                     return None, _xai_user_error("consulta de video")
