@@ -124,12 +124,19 @@ async def test_imagine_config_guard_before_mutation(sessions_file):
 
     callback = MagicMock()
     callback.from_user.id = uid
-    callback.data = "grokcfg:xai:quality"
+    callback.data = "cfg:variant:quality"
     callback.message = MagicMock()
     callback.answer = AsyncMock()
 
+    from conftest import make_fsm_context
+    import config_flow
+
     with patch.object(bot.sessions, "set_grok_imagine_config") as mock_set:
-        await bot.handle_grok_imagine_config(callback)
+        state = make_fsm_context(
+            config_model="grok",
+            fsm_state=config_flow._state_key(config_flow.ConfigStates.configure),
+        )
+        await bot.handle_cfg_variant(callback, state)
 
     mock_set.assert_not_called()
     callback.answer.assert_awaited_once()
@@ -175,17 +182,23 @@ async def test_confirm_stale_prompt_shows_error():
 async def test_model_switch_clears_pending_prompt(sessions_file):
     callback = MagicMock()
     callback.from_user.id = 2002
-    callback.data = "model:seedream"
+    callback.data = "cfg:model:seedream"
     callback.message = MagicMock()
     callback.message.edit_text = AsyncMock()
     callback.answer = AsyncMock()
 
-    state = bot.get_user_state(2002)
-    state["model"] = "grok_video"
-    state["pending_prompt"] = "stale prompt"
+    user_state = bot.get_user_state(2002)
+    user_state["model"] = "grok_video"
+    user_state["pending_prompt"] = "stale prompt"
 
-    with patch.object(bot, "safe_edit_text", new_callable=AsyncMock):
-        await bot.handle_model_selection(callback)
+    from conftest import make_fsm_context
+    import config_flow
 
-    assert state["pending_prompt"] is None
-    assert state["model"] == "seedream"
+    fsm_state = make_fsm_context(
+        fsm_state=config_flow._state_key(config_flow.ConfigStates.select_model),
+    )
+    bot._CONFIG_DEPS["safe_edit_text"] = AsyncMock()
+    await bot.handle_cfg_model(callback, fsm_state)
+
+    assert user_state["pending_prompt"] is None
+    assert user_state["model"] == "seedream"

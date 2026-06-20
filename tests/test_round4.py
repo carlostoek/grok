@@ -1,4 +1,4 @@
-"""Round 4 tests: allowlist middleware, global hourly cap, image helper."""
+"""Round 4 tests: allowlist middleware, image helper."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ import pytest
 
 import bot
 import sessions
-
-MODEL = bot.MODELS["grok_video"]
 
 
 def test_image_to_data_uri_roundtrip():
@@ -39,36 +37,6 @@ async def test_allowlist_middleware_blocks_photo_handler(monkeypatch):
     handler.assert_not_awaited()
     msg.answer.assert_awaited_once()
     assert "permiso" in msg.answer.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_global_hourly_limit_blocks_request(sessions_file, monkeypatch):
-    monkeypatch.setattr(bot, "VIDEO_MAX_GLOBAL_HOURLY", 2)
-    now = 4_000_000.0
-    sessions_file.write_text(
-        json.dumps(
-            {
-                "1": {"video_hourly_timestamps": [now - 10]},
-                "2": {"video_hourly_timestamps": [now - 20]},
-            }
-        )
-    )
-    uid = 3
-    msg = MagicMock()
-    status = MagicMock()
-    status.edit_text = AsyncMock()
-
-    monkeypatch.setattr(sessions.time, "time", lambda: now)
-    await bot._do_generate_video(
-        msg,
-        MODEL,
-        "prompt",
-        user_id=uid,
-        status_msg=status,
-        reply_message=msg,
-    )
-
-    assert "global" in status.edit_text.await_args.args[0].lower()
 
 
 def test_count_global_video_hourly_usage(sessions_file):

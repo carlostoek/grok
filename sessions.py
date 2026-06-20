@@ -16,17 +16,25 @@ class FsState:
 # Defaults for top-level model selection and the granular Grok Imagine config.
 # These power the independent persistent Imagine settings (provider + variant).
 DEFAULT_MODEL = "grok"
-DEFAULT_GROK_IMAGINE_PROVIDER = "xai"
+DEFAULT_GROK_IMAGINE_PROVIDER = "kie"
 DEFAULT_GROK_IMAGINE_VARIANT = "quality"
+VALID_GROK_IMAGINE_PROVIDERS = ("xai", "replicate", "kie")
+VALID_GROK_IMAGINE_VARIANTS = ("standard", "quality")
+VALID_MODELS = ("grok", "seedream", "faceswap", "grok_video")
 DEFAULT_VIDEO_DURATION = 5
 DEFAULT_VIDEO_ASPECT_RATIO = "16:9"
 DEFAULT_VIDEO_RESOLUTION = "720p"
 DEFAULT_VIDEO_MODEL = "grok-imagine-video"
-VALID_VIDEO_DURATIONS = (5, 10, 15)
+DEFAULT_VIDEO_MODE = "normal"
+VALID_VIDEO_DURATIONS = (3, 5, 10, 15)
 VALID_VIDEO_ASPECT_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3")
 VALID_VIDEO_RESOLUTIONS = ("480p", "720p")
 VALID_VIDEO_MODELS = ("grok-imagine-video", "grok-imagine-video-1.5")
+VALID_VIDEO_MODES = ("fun", "normal", "spicy")
 VIDEO_HOURLY_WINDOW_SEC = 3600
+
+GENERATION_REFS_FILE = Path(__file__).parent / "generation_refs.json"
+GENERATION_REF_TTL_SEC = 14 * 24 * 3600
 
 
 def _default_session_record(**overrides) -> dict:
@@ -41,6 +49,7 @@ def _default_session_record(**overrides) -> dict:
         "video_aspect_ratio": DEFAULT_VIDEO_ASPECT_RATIO,
         "video_resolution": DEFAULT_VIDEO_RESOLUTION,
         "video_model": DEFAULT_VIDEO_MODEL,
+        "video_mode": DEFAULT_VIDEO_MODE,
         "video_hourly_timestamps": [],
     }
     rec.update(overrides)
@@ -95,6 +104,9 @@ def _ensure_full(rec: dict) -> bool:
         changed = True
     if "video_model" not in rec:
         rec["video_model"] = DEFAULT_VIDEO_MODEL
+        changed = True
+    if "video_mode" not in rec:
+        rec["video_mode"] = DEFAULT_VIDEO_MODE
         changed = True
     return changed
 
@@ -156,6 +168,7 @@ def set_source(user_id: int, source_path: str) -> None:
         "video_aspect_ratio": current.get("video_aspect_ratio", DEFAULT_VIDEO_ASPECT_RATIO),
         "video_resolution": current.get("video_resolution", DEFAULT_VIDEO_RESOLUTION),
         "video_model": current.get("video_model", DEFAULT_VIDEO_MODEL),
+        "video_mode": current.get("video_mode", DEFAULT_VIDEO_MODE),
         "video_hourly_timestamps": current.get("video_hourly_timestamps", []),
     }
     _save(sessions)
@@ -165,6 +178,8 @@ def set_source(user_id: int, source_path: str) -> None:
 
 def set_model(user_id: int, model_key: str) -> None:
     """Persist the top-level model choice ("grok", "seedream", "faceswap", "grok_video")."""
+    if model_key not in VALID_MODELS:
+        model_key = DEFAULT_MODEL
     uid = str(user_id)
     sessions = _load()
     if uid not in sessions:
@@ -214,11 +229,16 @@ def get_video_config(user_id: int) -> dict:
     if video_model not in VALID_VIDEO_MODELS:
         video_model = DEFAULT_VIDEO_MODEL
 
+    video_mode = rec.get("video_mode", DEFAULT_VIDEO_MODE)
+    if video_mode not in VALID_VIDEO_MODES:
+        video_mode = DEFAULT_VIDEO_MODE
+
     return {
         "duration": duration,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "model": video_model,
+        "mode": video_mode,
     }
 
 
@@ -275,6 +295,7 @@ def set_video_config(
     aspect_ratio: str | None = None,
     resolution: str | None = None,
     model: str | None = None,
+    mode: str | None = None,
 ) -> None:
     """Persist video generation settings (duration, aspect ratio, resolution, model)."""
     uid = str(user_id)
@@ -295,14 +316,19 @@ def set_video_config(
     if model is not None:
         if model in VALID_VIDEO_MODELS:
             rec["video_model"] = model
+    if mode is not None:
+        if mode in VALID_VIDEO_MODES:
+            rec["video_mode"] = mode
     sessions_data[uid] = rec
     _save(sessions_data)
 
 
 def set_grok_imagine_config(user_id: int, provider: str, variant: str) -> None:
-    """Persist a change to the independent Grok Imagine detailed settings.
-    This is the main entry point for the separate /imagine configuration flow.
-    """
+    """Persist a change to the Grok Imagine provider and variant via the unified /config FSM."""
+    if provider not in VALID_GROK_IMAGINE_PROVIDERS:
+        provider = DEFAULT_GROK_IMAGINE_PROVIDER
+    if variant not in VALID_GROK_IMAGINE_VARIANTS:
+        variant = DEFAULT_GROK_IMAGINE_VARIANT
     uid = str(user_id)
     sessions = _load()
     if uid not in sessions:
@@ -316,3 +342,74 @@ def set_grok_imagine_config(user_id: int, provider: str, variant: str) -> None:
         rec["grok_imagine_provider"] = provider
         rec["grok_imagine_variant"] = variant
     _save(sessions)
+
+
+# --- Kie.ai generation refs (chat_id:message_id → task_id for chained edits) ---
+
+def _load_generation_refs() -> dict:
+    if GENERATION_REFS_FILE.exists():
+        with open(GENERATION_REFS_FILE, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _save_generation_refs(data: dict) -> None:
+    GENERATION_REFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(GENERATION_REFS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _generation_ref_key(chat_id: int, message_id: int) -> str:
+    return f"{chat_id}:{message_id}"
+
+
+def _prune_generation_refs(refs: dict, now: float | None = None) -> dict:
+    now = now if now is not None else time.time()
+    pruned: dict = {}
+    for key, rec in refs.items():
+        if not isinstance(rec, dict):
+            continue
+        created = rec.get("created_at")
+        try:
+            created_f = float(created)
+        except (TypeError, ValueError):
+            continue
+        if now - created_f < GENERATION_REF_TTL_SEC:
+            pruned[key] = rec
+    return pruned
+
+
+def save_generation_ref(
+    chat_id: int,
+    message_id: int,
+    *,
+    kie_task_id: str,
+    kie_index: int = 0,
+    provider: str = "kie",
+    kind: str = "image",
+    prompt: str = "",
+) -> None:
+    """Persist Kie task metadata for a bot-sent image (enables task_id i2v/i2i)."""
+    refs = _prune_generation_refs(_load_generation_refs())
+    refs[_generation_ref_key(chat_id, message_id)] = {
+        "kie_task_id": kie_task_id,
+        "kie_index": max(0, min(int(kie_index), 5)),
+        "provider": provider,
+        "kind": kind,
+        "prompt": prompt[:500] if prompt else "",
+        "created_at": time.time(),
+    }
+    _save_generation_refs(refs)
+
+
+def get_generation_ref(chat_id: int, message_id: int) -> dict | None:
+    """Return generation metadata for a bot message, or None if missing/expired."""
+    refs = _prune_generation_refs(_load_generation_refs())
+    key = _generation_ref_key(chat_id, message_id)
+    rec = refs.get(key)
+    if rec is None:
+        return None
+    if refs != _load_generation_refs():
+        _save_generation_refs(refs)
+    return rec

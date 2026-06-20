@@ -15,6 +15,7 @@ def test_get_video_config_defaults(sessions_file):
         "aspect_ratio": "16:9",
         "resolution": "720p",
         "model": sessions.DEFAULT_VIDEO_MODEL,
+        "mode": sessions.DEFAULT_VIDEO_MODE,
     }
 
 
@@ -101,6 +102,7 @@ def test_set_video_config_persists_fields(sessions_file):
         "aspect_ratio": "3:2",
         "resolution": "480p",
         "model": sessions.DEFAULT_VIDEO_MODEL,
+        "mode": sessions.DEFAULT_VIDEO_MODE,
     }
 
 

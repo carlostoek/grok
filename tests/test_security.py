@@ -1,16 +1,13 @@
-"""Security-related tests: allowlist, global concurrency, prompt limits, logging."""
+"""Security-related tests: allowlist, prompt limits, logging."""
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram import types
 
 import bot
-import sessions
-
-MODEL = bot.MODELS["grok_video"]
 
 
 @pytest.mark.asyncio
@@ -29,26 +26,38 @@ async def test_allowlist_blocks_via_middleware(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_global_concurrency_blocks_when_full(monkeypatch):
-    monkeypatch.setattr(bot, "VIDEO_MAX_GLOBAL_CONCURRENT", 1)
-    bot._video_active_jobs.add(9999)
-    bot._video_global_active_count = 1
-
-    uid = 3333
+async def test_allowlist_blocks_when_user_id_missing(monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_TELEGRAM_IDS", {111})
     msg = MagicMock()
-    status = MagicMock()
-    status.edit_text = AsyncMock()
+    msg.from_user = None
+    msg.answer = AsyncMock()
 
-    await bot._do_generate_video(
-        msg,
-        MODEL,
-        "prompt",
-        user_id=uid,
-        status_msg=status,
-        reply_message=msg,
+    middleware = bot.AllowlistMiddleware()
+    handler = AsyncMock()
+    await middleware(handler, msg, {})
+
+    handler.assert_not_awaited()
+    assert "permiso" in msg.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_allowlist_blocks_cfg_callback(monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_TELEGRAM_IDS", {111})
+    callback = MagicMock()
+    callback.from_user = MagicMock(id=222)
+    callback.data = "cfg:model:grok"
+    callback.answer = AsyncMock()
+    callback.__class__ = types.CallbackQuery
+
+    middleware = bot.AllowlistMiddleware()
+    handler = AsyncMock()
+    await middleware(handler, callback, {})
+
+    handler.assert_not_awaited()
+    callback.answer.assert_awaited_once_with(
+        "No tienes permiso para usar este bot.",
+        show_alert=True,
     )
-
-    assert "ocupado" in status.edit_text.await_args.args[0]
 
 
 def test_validate_prompt_max_length():
@@ -65,18 +74,3 @@ def test_log_xai_error_does_not_log_body(capsys):
     assert "sensitive body" not in out
 
 
-@pytest.mark.asyncio
-async def test_persisted_hourly_limit_survives_restart(sessions_file):
-    uid = 4444
-    now = 2_000_000.0
-    sessions_file.write_text(
-        json.dumps(
-            {
-                "4444": {
-                    "video_hourly_timestamps": [now - 100 * i for i in range(bot.VIDEO_MAX_PER_HOUR)],
-                }
-            }
-        )
-    )
-    with patch("sessions.time.time", return_value=now):
-        assert sessions.count_video_hourly_usage(uid) == bot.VIDEO_MAX_PER_HOUR

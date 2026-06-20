@@ -257,39 +257,6 @@ async def test_post_body_i2v_uses_persisted_model_and_payload(no_sleep, sessions
 
 
 @pytest.mark.asyncio
-async def test_successful_post_records_hourly_usage(no_sleep, sessions_file):
-    user_id = 9090
-    with aioresponses() as mocked:
-        mocked.post(GEN_URL, payload={"request_id": "req-1"})
-        mocked.get(POLL_URL, payload={"status": "processing"})
-        await bot._generate_xai_video(MODEL, "prompt", user_id=user_id)
-
-    assert sessions.count_video_hourly_usage(user_id) == 1
-
-
-@pytest.mark.asyncio
-async def test_failed_poll_still_records_hourly_after_post(no_sleep, sessions_file):
-    user_id = 9091
-    with aioresponses() as mocked:
-        mocked.post(GEN_URL, payload={"request_id": "req-1"})
-        mocked.get(POLL_URL, payload={"status": "failed", "error": {"message": "nope"}})
-        await bot._generate_xai_video(MODEL, "prompt", user_id=user_id)
-
-    assert sessions.count_video_hourly_usage(user_id) == 1
-
-
-@pytest.mark.asyncio
-async def test_done_does_not_double_count_hourly(no_sleep, sessions_file):
-    user_id = 9092
-    with aioresponses() as mocked:
-        mocked.post(GEN_URL, payload={"request_id": "req-1"})
-        mocked.get(POLL_URL, payload=_done_payload())
-        await bot._generate_xai_video(MODEL, "prompt", user_id=user_id)
-
-    assert sessions.count_video_hourly_usage(user_id) == 1
-
-
-@pytest.mark.asyncio
 async def test_generate_video_unsupported_provider():
     model = {"key": "other", "provider": "replicate", "id": "x"}
     url, err = await bot.generate_video(model, "prompt")

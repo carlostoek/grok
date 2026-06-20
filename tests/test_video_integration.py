@@ -8,6 +8,7 @@ import pytest
 from aioresponses import aioresponses
 
 import bot
+import sessions
 
 GEN_URL = "https://api.x.ai/v1/videos/generations"
 POLL_URL = "https://api.x.ai/v1/videos/req-e2e"
@@ -29,6 +30,7 @@ async def test_confirm_to_delivery_chain(sessions_file):
     callback.message.delete = AsyncMock()
     callback.answer = AsyncMock()
 
+    sessions.set_grok_imagine_config(user_id, "xai", "quality")
     bot.get_user_state(user_id)["model"] = "grok_video"
     bot.get_user_state(user_id)["pending_prompt"] = prompt
 

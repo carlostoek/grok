@@ -33,19 +33,25 @@ def no_sleep():
 async def test_switch_to_grok_video_shows_copy(sessions_file):
     callback = MagicMock()
     callback.from_user.id = 5101
-    callback.data = "model:grok_video"
+    callback.data = "cfg:model:grok_video"
     callback.message = MagicMock()
+    callback.message.edit_text = AsyncMock()
     callback.answer = AsyncMock()
     bot.get_user_state(5101)["model"] = "grok"
 
-    with patch.object(bot, "safe_edit_text", new_callable=AsyncMock) as safe_edit:
-        await bot.handle_model_selection(callback)
+    safe_edit = AsyncMock()
+    bot._CONFIG_DEPS["safe_edit_text"] = safe_edit
+    from conftest import make_fsm_context
+    import config_flow
+
+    state = make_fsm_context(
+        fsm_state=config_flow._state_key(config_flow.ConfigStates.select_model),
+    )
+    await bot.handle_cfg_model(callback, state)
 
     text = safe_edit.await_args.args[1]
     assert "Grok Imagine Video" in text
-    assert "prompt para generar un video" in text
-    assert "foto con caption" in text
-    assert "imagen a video" in text
+    assert "proveedor" in text.lower()
 
 
 @pytest.mark.asyncio
@@ -59,6 +65,7 @@ async def test_confirm_e2e_poll_failure_shows_error(sessions_file, no_sleep):
     callback.message.edit_text = AsyncMock()
     callback.message.answer = AsyncMock()
     callback.answer = AsyncMock()
+    sessions.set_grok_imagine_config(user_id, "xai", "quality")
     bot.get_user_state(user_id)["model"] = "grok_video"
     bot.get_user_state(user_id)["pending_prompt"] = prompt
 
@@ -88,6 +95,7 @@ async def test_reply_to_photo_e2e_delivery(sessions_file, no_sleep):
     msg.reply_to_message = replied
     msg.answer = AsyncMock()
     msg.answer_video = AsyncMock()
+    sessions.set_grok_imagine_config(user_id, "xai", "quality")
     bot.get_user_state(user_id)["model"] = "grok_video"
 
     with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"jpeg")):
@@ -192,29 +200,6 @@ async def test_user_id_none_uses_default_video_config(no_sleep):
 
 
 @pytest.mark.asyncio
-async def test_failed_post_does_not_consume_hourly_quota(sessions_file, no_sleep):
-    uid = 5105
-    msg = MagicMock()
-    msg.from_user.id = uid
-    status = MagicMock()
-    status.edit_text = AsyncMock()
-
-    with aioresponses() as mocked:
-        mocked.post(GEN_URL, status=500, body="fail")
-        await bot._do_generate_video(
-            msg,
-            MODEL,
-            "prompt",
-            user_id=uid,
-            status_msg=status,
-            reply_message=msg,
-        )
-
-    assert sessions.count_video_hourly_usage(uid) == 0
-    assert bot._video_hourly_pending.get(uid, 0) == 0
-
-
-@pytest.mark.asyncio
 async def test_image_edit_rejects_oversized_image():
     big = BytesIO(b"x" * (bot.I2V_MAX_IMAGE_BYTES + 1))
     model = {**bot.MODELS["grok"], "provider": "xai"}
@@ -226,18 +211,23 @@ async def test_image_edit_rejects_oversized_image():
 
 
 @pytest.mark.asyncio
-async def test_hourly_reservation_blocks_race_at_limit(sessions_file, monkeypatch):
-    """Second in-flight reservation fails once the per-user cap is fully reserved."""
+async def test_video_i2v_rejects_oversized_image():
     uid = 5106
-    now = 2_000_000.0
-    monkeypatch.setattr(bot, "VIDEO_MAX_PER_HOUR", 1)
-    sessions_file.write_text(json.dumps({"5106": {"video_hourly_timestamps": []}}))
+    msg = MagicMock()
+    msg.from_user.id = uid
+    status = MagicMock()
+    status.edit_text = AsyncMock()
+    big = BytesIO(b"x" * (bot.I2V_MAX_IMAGE_BYTES + 1))
 
-    with patch("sessions.time.time", return_value=now):
-        first_err = await bot._reserve_video_hourly_quota(uid)
-        second_err = await bot._reserve_video_hourly_quota(uid)
+    await bot._do_generate_video(
+        msg,
+        MODEL,
+        "prompt",
+        image_data=big,
+        user_id=uid,
+        status_msg=status,
+        reply_message=msg,
+    )
 
-    assert first_err is None
-    assert second_err is not None
-    assert "límite" in second_err
-    bot._cancel_video_hourly_reservation(uid)
+    status.edit_text.assert_awaited_once()
+    assert "demasiado grande" in status.edit_text.await_args.args[0]

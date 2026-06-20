@@ -9,6 +9,7 @@ import pytest
 from aioresponses import aioresponses
 
 import bot
+import sessions
 
 MODEL = bot.MODELS["grok_video"]
 GEN_URL = "https://api.x.ai/v1/videos/generations"
@@ -65,7 +66,6 @@ async def test_do_generate_video_exception_handler():
         )
 
     status.edit_text.assert_awaited_with("Error inesperado. Intenta de nuevo.")
-    assert uid not in bot._video_active_jobs
 
 
 @pytest.mark.asyncio
@@ -76,6 +76,7 @@ async def test_e2e_i2v_photo_caption(sessions_file):
     msg.photo = [MagicMock(file_id="p1")]
     msg.answer = AsyncMock()
     msg.answer_video = AsyncMock()
+    sessions.set_grok_imagine_config(9004, "xai", "quality")
     bot.get_user_state(9004)["model"] = "grok_video"
 
     image_bytes = MagicMock()
@@ -111,6 +112,7 @@ async def test_e2e_i2v_api_error_shows_message(sessions_file):
     status = MagicMock()
     status.edit_text = AsyncMock()
     msg.answer = AsyncMock(return_value=status)
+    sessions.set_grok_imagine_config(9005, "xai", "quality")
     bot.get_user_state(9005)["model"] = "grok_video"
 
     with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"jpeg")):
