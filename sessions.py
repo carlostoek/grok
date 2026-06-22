@@ -384,22 +384,29 @@ def save_generation_ref(
     chat_id: int,
     message_id: int,
     *,
-    kie_task_id: str,
+    kie_task_id: str | None = None,
     kie_index: int = 0,
     provider: str = "kie",
     kind: str = "image",
     prompt: str = "",
+    regen: dict | None = None,
 ) -> None:
-    """Persist Kie task metadata for a bot-sent image (enables task_id i2v/i2i)."""
+    """Persist generation metadata for a bot-sent image (Kie chaining + regenerate button)."""
+    if not kie_task_id and not regen:
+        return
     refs = _prune_generation_refs(_load_generation_refs())
-    refs[_generation_ref_key(chat_id, message_id)] = {
-        "kie_task_id": kie_task_id,
-        "kie_index": max(0, min(int(kie_index), 5)),
+    rec: dict = {
         "provider": provider,
         "kind": kind,
         "prompt": prompt[:500] if prompt else "",
         "created_at": time.time(),
     }
+    if kie_task_id:
+        rec["kie_task_id"] = kie_task_id
+        rec["kie_index"] = max(0, min(int(kie_index), 5))
+    if regen:
+        rec["regen"] = regen
+    refs[_generation_ref_key(chat_id, message_id)] = rec
     _save_generation_refs(refs)
 
 

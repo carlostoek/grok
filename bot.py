@@ -324,12 +324,82 @@ def get_video_provider_for_user(user_id: int) -> str:
 
 
 async def _download_telegram_photo(photo: types.PhotoSize) -> BytesIO:
-    file = await bot.get_file(photo.file_id)
+    return await _download_telegram_file_id(photo.file_id)
+
+
+async def _download_telegram_file_id(file_id: str) -> BytesIO:
+    file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(file.file_path)
     file_bytes.seek(0)
     image_data = BytesIO(file_bytes.read())
     image_data.name = "image.jpg"
     return image_data
+
+
+def _image_regenerate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Regenerar", callback_data="regen")],
+        ]
+    )
+
+
+def _grok_model_for_config(user_id: int, provider: str, variant: str) -> dict:
+    m = dict(MODELS["grok"])
+    spec = GROK_IMAGINE_VARIANTS.get(variant, GROK_IMAGINE_VARIANTS[sessions.DEFAULT_GROK_IMAGINE_VARIANT])
+    if provider == "replicate":
+        model_id = spec["replicate_id"]
+    elif provider == "kie":
+        model_id = spec["kie_id"]
+    else:
+        model_id = spec["id"]
+    prov_label = _prov_label(provider)
+    m["provider"] = provider
+    m["id"] = model_id
+    m["name"] = f"Grok Imagine ({prov_label} • {spec['label']})"
+    m["desc"] = f"xAI Grok Imagine — {prov_label} • {spec['label']}: {spec['desc']}"
+    m["imagine_provider"] = provider
+    m["imagine_variant"] = variant
+    return m
+
+
+def _model_from_regen(regen: dict) -> dict:
+    key = regen.get("model_key", DEFAULT_MODEL)
+    if key == "grok":
+        prov = regen.get("imagine_provider", sessions.DEFAULT_GROK_IMAGINE_PROVIDER)
+        var = regen.get("imagine_variant", sessions.DEFAULT_GROK_IMAGINE_VARIANT)
+        return _grok_model_for_config(regen["user_id"], prov, var)
+    return MODELS.get(key, MODELS[DEFAULT_MODEL])
+
+
+def _build_image_regen_context(
+    *,
+    model: dict,
+    user_id: int,
+    prompt: str,
+    mode: str,
+    source_file_id: str | None = None,
+    kie_source_ref: dict | None = None,
+) -> dict:
+    ctx: dict = {
+        "mode": mode,
+        "model_key": model["key"],
+        "user_id": user_id,
+        "prompt": prompt,
+        "provider": model.get("provider", "?"),
+    }
+    if model["key"] == "grok":
+        cfg = get_grok_imagine_config(user_id)
+        ctx["imagine_provider"] = model.get("imagine_provider", cfg["provider"])
+        ctx["imagine_variant"] = model.get("imagine_variant", cfg["variant"])
+    if source_file_id:
+        ctx["source_file_id"] = source_file_id
+    if kie_source_ref:
+        ctx["kie_source_ref"] = {
+            "task_id": kie_source_ref["task_id"],
+            "index": kie_source_ref.get("index", 0),
+        }
+    return ctx
 
 
 def _resolve_reply_kie_ref(reply_to_message: types.Message | None) -> dict | None:
@@ -642,7 +712,70 @@ async def handle_confirm_generation(callback: types.CallbackQuery):
         reply_markup=None,
     )
     await callback.answer()
-    await _do_generate_text(callback.message, model, prompt)
+    await _do_generate_text(callback.message, model, prompt, user_id=callback.from_user.id)
+
+
+@dp.callback_query(lambda c: c.data == "regen")
+async def handle_regenerate_image(callback: types.CallbackQuery):
+    if callback.message is None or not callback.message.photo:
+        await callback.answer("Mensaje no valido.", show_alert=True)
+        return
+
+    ref = sessions.get_generation_ref(callback.message.chat.id, callback.message.message_id)
+    regen = ref.get("regen") if ref else None
+    if not regen:
+        await callback.answer("No se puede regenerar (contexto expirado).", show_alert=True)
+        return
+
+    prompt = regen.get("prompt", "").strip()
+    prompt_err = _validate_prompt(prompt)
+    if prompt_err:
+        await callback.answer(prompt_err, show_alert=True)
+        return
+
+    model = _model_from_regen(regen)
+    mode = regen.get("mode", "text")
+    await callback.answer("Regenerando...")
+
+    status_msg = await callback.message.answer(f"Regenerando imagen con {model['name']}...")
+    image_data = None
+    kie_source_ref = regen.get("kie_source_ref")
+    source_file_id = regen.get("source_file_id")
+
+    try:
+        if mode == "edit" and not kie_source_ref:
+            if source_file_id:
+                image_data = await _download_telegram_file_id(source_file_id)
+            else:
+                await status_msg.edit_text("No se pudo recuperar la imagen original para regenerar.")
+                return
+
+        output, err, kie_meta = await generate_image(
+            model,
+            prompt,
+            image_data,
+            kie_source_ref=kie_source_ref,
+        )
+        if err:
+            await status_msg.edit_text(err)
+            return
+
+        prefix = "Edit" if mode == "edit" else "Prompt"
+        await process_image_result(
+            output,
+            prompt,
+            status_msg,
+            callback.message,
+            prefix,
+            download_allowlist=_download_allowlist_for_provider(model.get("provider")),
+            kie_meta=kie_meta,
+            regen_context=regen,
+        )
+    except replicate.exceptions.ReplicateError as e:
+        backend = _prov_label(model.get("provider", "?"))
+        await status_msg.edit_text(f"Error de {backend}: {e}")
+    except Exception as e:
+        await status_msg.edit_text(f"Error inesperado: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +895,14 @@ async def handle_text(message: types.Message):
     await _do_generate_text(message, model, prompt)
 
 
-async def _do_generate_text(message: types.Message, model: dict, prompt: str):
+async def _do_generate_text(
+    message: types.Message,
+    model: dict,
+    prompt: str,
+    *,
+    user_id: int | None = None,
+):
+    uid = user_id if user_id is not None else message.from_user.id
     status_msg = await message.answer(f"Generando imagen con {model['name']}...")
 
     backend = _prov_label(model.get("provider", "?"))
@@ -779,6 +919,12 @@ async def _do_generate_text(message: types.Message, model: dict, prompt: str):
             "Prompt",
             download_allowlist=_download_allowlist_for_provider(model.get("provider")),
             kie_meta=kie_meta,
+            regen_context=_build_image_regen_context(
+                model=model,
+                user_id=uid,
+                prompt=prompt,
+                mode="text",
+            ),
         )
     except replicate.exceptions.ReplicateError as e:
         await status_msg.edit_text(f"Error de {backend}: {e}")
@@ -892,6 +1038,13 @@ async def handle_photo_caption(message: types.Message):
             "Edit",
             download_allowlist=_download_allowlist_for_provider(model.get("provider")),
             kie_meta=kie_meta,
+            regen_context=_build_image_regen_context(
+                model=model,
+                user_id=message.from_user.id,
+                prompt=prompt,
+                mode="edit",
+                source_file_id=message.photo[-1].file_id,
+            ),
         )
     except replicate.exceptions.ReplicateError as e:
         backend = _prov_label(model.get("provider", "?"))
@@ -987,6 +1140,9 @@ async def handle_reply_edit(message: types.Message):
         if err:
             await status_msg.edit_text(err)
             return
+        source_file_id = None
+        if kie_source_ref is None and message.reply_to_message.photo:
+            source_file_id = message.reply_to_message.photo[-1].file_id
         await process_image_result(
             output,
             prompt,
@@ -995,6 +1151,14 @@ async def handle_reply_edit(message: types.Message):
             "Edit",
             download_allowlist=_download_allowlist_for_provider(model.get("provider")),
             kie_meta=kie_meta,
+            regen_context=_build_image_regen_context(
+                model=model,
+                user_id=message.from_user.id,
+                prompt=prompt,
+                mode="edit",
+                source_file_id=source_file_id,
+                kie_source_ref=kie_source_ref,
+            ),
         )
     except replicate.exceptions.ReplicateError as e:
         backend = _prov_label(model.get("provider", "?"))
@@ -1640,6 +1804,7 @@ async def process_image_result(
     *,
     download_allowlist: str | None = None,
     kie_meta: dict | None = None,
+    regen_context: dict | None = None,
 ):
     if output is None:
         await status_msg.edit_text("Error: el modelo no devolvio nada. Intenta con otro prompt.")
@@ -1658,17 +1823,23 @@ async def process_image_result(
         photo,
         caption=f"<b>{prefix}:</b> {_escape_prompt(prompt)}",
         parse_mode="HTML",
+        reply_markup=_image_regenerate_keyboard(),
     )
-    if kie_meta and kie_meta.get("task_id"):
-        sessions.save_generation_ref(
-            message.chat.id,
-            sent_msg.message_id,
-            kie_task_id=kie_meta["task_id"],
-            kie_index=kie_meta.get("index", 0),
-            provider=kie_meta.get("provider", "kie"),
-            kind="image",
-            prompt=prompt,
-        )
+    provider = (
+        kie_meta.get("provider")
+        if kie_meta and kie_meta.get("task_id")
+        else (regen_context or {}).get("provider", "unknown")
+    )
+    sessions.save_generation_ref(
+        message.chat.id,
+        sent_msg.message_id,
+        kie_task_id=kie_meta.get("task_id") if kie_meta else None,
+        kie_index=kie_meta.get("index", 0) if kie_meta else 0,
+        provider=provider,
+        kind="image",
+        prompt=prompt,
+        regen=regen_context,
+    )
     await status_msg.delete()
 
 

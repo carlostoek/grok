@@ -1121,6 +1121,23 @@ def test_save_and_get_generation_ref(generation_refs_file):
     assert ref["provider"] == "kie"
 
 
+def test_save_generation_ref_regen_without_kie_task(generation_refs_file):
+    regen = {
+        "mode": "text",
+        "model_key": "grok",
+        "user_id": 55,
+        "prompt": "sunset",
+        "provider": "xai",
+        "imagine_provider": "xai",
+        "imagine_variant": "quality",
+    }
+    sessions.save_generation_ref(100, 77, provider="xai", prompt="sunset", regen=regen)
+    ref = sessions.get_generation_ref(100, 77)
+    assert "kie_task_id" not in ref
+    assert ref["regen"]["mode"] == "text"
+    assert ref["regen"]["user_id"] == 55
+
+
 @pytest.mark.asyncio
 async def test_kie_i2v_task_id_uses_spicy_mode(no_sleep, sessions_file):
     sessions.set_video_config(8010, mode="spicy")
@@ -1229,6 +1246,12 @@ async def test_process_image_result_saves_generation_ref(generation_refs_file):
     sent = MagicMock()
     sent.message_id = 99
     message.answer_photo = AsyncMock(return_value=sent)
+    regen = bot._build_image_regen_context(
+        model={"key": "grok", "provider": "kie", "imagine_provider": "kie", "imagine_variant": "quality"},
+        user_id=501,
+        prompt="neon cat",
+        mode="text",
+    )
 
     with patch.object(bot, "download_url", new_callable=AsyncMock, return_value=(b"png", None)):
         await bot.process_image_result(
@@ -1239,10 +1262,78 @@ async def test_process_image_result_saves_generation_ref(generation_refs_file):
             "Prompt",
             download_allowlist="kie",
             kie_meta={"task_id": "task-save", "index": 0, "provider": "kie"},
+            regen_context=regen,
         )
 
     ref = sessions.get_generation_ref(200, 99)
     assert ref["kie_task_id"] == "task-save"
+    assert ref["regen"]["mode"] == "text"
+    kwargs = message.answer_photo.await_args.kwargs
+    assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "regen"
+
+
+@pytest.mark.asyncio
+async def test_handle_regenerate_image_text_mode(no_sleep, generation_refs_file):
+    uid = 9201
+    sessions.set_grok_imagine_config(uid, "kie", "standard")
+    regen = bot._build_image_regen_context(
+        model=bot.get_model(uid),
+        user_id=uid,
+        prompt="blue moon",
+        mode="text",
+    )
+    sessions.save_generation_ref(400, 88, provider="kie", prompt="blue moon", regen=regen)
+
+    photo_msg = MagicMock()
+    photo_msg.photo = [MagicMock()]
+    photo_msg.chat.id = 400
+    photo_msg.message_id = 88
+    photo_msg.answer = AsyncMock(return_value=MagicMock())
+
+    callback = MagicMock()
+    callback.message = photo_msg
+    callback.answer = AsyncMock()
+
+    with patch.object(bot, "generate_image", new_callable=AsyncMock, return_value=([RESULT_URL], None, None)):
+        with patch.object(bot, "process_image_result", new_callable=AsyncMock) as mock_proc:
+            await bot.handle_regenerate_image(callback)
+
+    callback.answer.assert_awaited_once_with("Regenerando...")
+    mock_proc.assert_awaited_once()
+    assert mock_proc.await_args.args[1] == "blue moon"
+    assert mock_proc.await_args.kwargs["regen_context"] == regen
+
+
+@pytest.mark.asyncio
+async def test_handle_regenerate_image_edit_uses_kie_ref(no_sleep, generation_refs_file):
+    uid = 9202
+    sessions.set_grok_imagine_config(uid, "kie", "standard")
+    regen = bot._build_image_regen_context(
+        model=bot.get_model(uid),
+        user_id=uid,
+        prompt="add hat",
+        mode="edit",
+        kie_source_ref={"task_id": "prior-task", "index": 1},
+    )
+    sessions.save_generation_ref(401, 89, provider="kie", prompt="add hat", regen=regen)
+
+    photo_msg = MagicMock()
+    photo_msg.photo = [MagicMock()]
+    photo_msg.chat.id = 401
+    photo_msg.message_id = 89
+    photo_msg.answer = AsyncMock(return_value=MagicMock())
+
+    callback = MagicMock()
+    callback.message = photo_msg
+    callback.answer = AsyncMock()
+
+    with patch.object(bot, "generate_image", new_callable=AsyncMock, return_value=([RESULT_URL], None, None)) as mock_gen:
+        with patch.object(bot, "process_image_result", new_callable=AsyncMock):
+            await bot.handle_regenerate_image(callback)
+
+    mock_gen.assert_awaited_once()
+    assert mock_gen.await_args.kwargs["kie_source_ref"] == {"task_id": "prior-task", "index": 1}
+    assert mock_gen.await_args.args[2] is None
 
 
 @pytest.mark.asyncio
