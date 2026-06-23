@@ -581,6 +581,7 @@ async def cmd_start(message: types.Message):
             "Ejemplo: <i>a cat wearing a wizard hat in a neon-lit cyberpunk alley</i>\n",
             "Tambien puedes enviar una <b>foto con caption</b> para editarla o animarla:\n",
             "la IA tomara tu imagen y aplicara los cambios que describas en el caption.\n",
+            "Tambien puedes enviar un <b>album de fotos con caption</b> para editarlas todas con el mismo prompt.\n",
         ]
 
     lines.append(f"Modelo actual: <b>{model['name']}</b>\n")
@@ -998,7 +999,7 @@ async def _do_generate_video(
 # ---------------------------------------------------------------------------
 # PHOTO + CAPTION  — route by model
 # ---------------------------------------------------------------------------
-@dp.message(lambda m: m.photo and m.caption)
+@dp.message(lambda m: m.photo and m.caption and not m.media_group_id)
 async def handle_photo_caption(message: types.Message):
     state = get_user_state(message.from_user.id)
 
@@ -1174,41 +1175,137 @@ async def handle_reply_edit(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
-# ALBUM (media group) — only for faceswap
+# ALBUM (media group) — faceswap batch swap; grok sequential i2i edit
 # ---------------------------------------------------------------------------
 _album_cache: dict[tuple, list] = {}
 _album_lock = asyncio.Lock()
 ALBUM_COLLECT_DELAY = 1.0
 
 
+def _album_prompt(messages: list[types.Message]) -> str | None:
+    for msg in sorted(messages, key=lambda m: m.message_id):
+        if msg.caption and msg.caption.strip():
+            return msg.caption.strip()
+    return None
+
+
 @dp.message(lambda m: m.photo and m.media_group_id)
 async def handle_album(message: types.Message):
     state = get_user_state(message.from_user.id)
+    model_key = state["model"]
 
-    if state["model"] != "faceswap":
-        return  # silently ignore albums for image generation models
-
-    if state["fs_state"] == sessions.FsState.AWAITING_SOURCE:
-        await _handle_faceswap_source_photo(message)
-        return
-
-    if not state["source_path"]:
-        await message.answer(
-            "Primero configura tu cara fuente con /cambiar_source."
-        )
+    if model_key not in ("faceswap", "grok"):
         return
 
     media_group_id = message.media_group_id
     chat_id = message.chat.id
     cache_key = (chat_id, media_group_id)
 
+    if model_key == "faceswap":
+        if state["fs_state"] == sessions.FsState.AWAITING_SOURCE:
+            await _handle_faceswap_source_photo(message)
+            return
+
+        if not state["source_path"]:
+            await message.answer(
+                "Primero configura tu cara fuente con /cambiar_source."
+            )
+            return
+
+        async with _album_lock:
+            if cache_key not in _album_cache:
+                _album_cache[cache_key] = []
+                asyncio.create_task(
+                    _process_album_after_delay(cache_key, chat_id, message)
+                )
+            _album_cache[cache_key].append(message)
+        return
+
     async with _album_lock:
         if cache_key not in _album_cache:
             _album_cache[cache_key] = []
             asyncio.create_task(
-                _process_album_after_delay(cache_key, chat_id, message)
+                _process_grok_album_after_delay(cache_key, message)
             )
         _album_cache[cache_key].append(message)
+
+
+async def _process_grok_album_after_delay(cache_key: tuple, first_msg: types.Message):
+    await asyncio.sleep(ALBUM_COLLECT_DELAY)
+
+    async with _album_lock:
+        messages = _album_cache.pop(cache_key, [])
+
+    if not messages:
+        return
+
+    messages = sorted(messages, key=lambda m: m.message_id)
+    n = len(messages)
+
+    prompt = _album_prompt(messages)
+    if not prompt:
+        await first_msg.answer(
+            "Para editar una imagen, enviala con un <b>caption</b> describiendo los cambios que quieres.\n\n"
+            "Ejemplo: envia tu foto con el texto <i>\"cambia el fondo a una playa al atardecer\"</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    prompt_err = _validate_prompt(prompt)
+    if prompt_err:
+        await first_msg.answer(prompt_err)
+        return
+
+    model = get_model(first_msg.from_user.id)
+    backend = _prov_label(model.get("provider", "?"))
+    status_msg = None
+
+    try:
+        status_msg = await first_msg.reply(
+            f"Editando 0/{n} imágenes con {model['name']} ({backend})..."
+        )
+
+        for i, msg in enumerate(messages, 1):
+            await status_msg.edit_text(
+                f"Editando {i}/{n} imágenes con {model['name']} ({backend})..."
+            )
+            image_data = await _download_telegram_photo(msg.photo[-1])
+            output, err, kie_meta = await generate_image(model, prompt, image_data)
+            if err:
+                await status_msg.edit_text(
+                    f"{i - 1}/{n} completadas; error en imagen {i}: {err}"
+                )
+                break
+            await process_image_result(
+                output,
+                prompt,
+                status_msg,
+                first_msg,
+                "Edit",
+                delete_status=False,
+                download_allowlist=_download_allowlist_for_provider(model.get("provider")),
+                kie_meta=kie_meta,
+                regen_context=_build_image_regen_context(
+                    model=model,
+                    user_id=first_msg.from_user.id,
+                    prompt=prompt,
+                    mode="edit",
+                    source_file_id=msg.photo[-1].file_id,
+                ),
+            )
+        else:
+            await status_msg.edit_text(f"Completadas {n}/{n} imágenes.")
+
+    except replicate.exceptions.ReplicateError as e:
+        if status_msg:
+            await status_msg.edit_text(f"Error de {backend}: {e}")
+        else:
+            await first_msg.answer(f"Error de {backend}: {e}")
+    except Exception as e:
+        if status_msg:
+            await status_msg.edit_text(f"Error inesperado: {e}")
+        else:
+            await first_msg.answer(f"Error inesperado: {e}")
 
 
 async def _process_album_after_delay(cache_key: tuple, chat_id: int, first_msg: types.Message):
@@ -1805,6 +1902,7 @@ async def process_image_result(
     download_allowlist: str | None = None,
     kie_meta: dict | None = None,
     regen_context: dict | None = None,
+    delete_status: bool = True,
 ):
     if output is None:
         await status_msg.edit_text("Error: el modelo no devolvio nada. Intenta con otro prompt.")
@@ -1840,7 +1938,8 @@ async def process_image_result(
         prompt=prompt,
         regen=regen_context,
     )
-    await status_msg.delete()
+    if delete_status:
+        await status_msg.delete()
 
 
 async def download_url(
