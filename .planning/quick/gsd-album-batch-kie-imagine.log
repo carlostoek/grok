@@ -1,0 +1,33 @@
+# GSD Executor Log: album-batch-kie-imagine
+# Started: 2026-06-23
+
+## Phase 1 — Fix handle_photo_caption filter
+[LOG] Applying filter change: add `and not m.media_group_id` to handle_photo_caption decorator
+[GATE] Phase 1 filter applied
+
+## Phase 2 — Album orchestration + delete_status + /start help
+[LOG] Adding delete_status param to process_image_result
+[LOG] Adding _album_prompt helper
+[LOG] Adding _process_grok_album_after_delay
+[LOG] Refactoring handle_album for grok branch
+[LOG] Updating cmd_start help text for grok album
+[GATE] Phase 2 bot.py changes applied
+
+## Phase 3 — Unit tests
+[LOG] Creating tests/test_album_batch.py with 11 tests
+[LOG] Fixed album task drainage in tests via asyncio.create_task capture fixture
+[GATE] Phase 3 tests: 11/11 passed
+
+## Final verification
+[LOG] Running ./venv/bin/python -m pytest tests/ -q
+[RESULT] 226 passed, 2 skipped
+
+## Self-check against PLAN checklist
+- [x] Fase 1: filtro handle_photo_caption corregido (`not m.media_group_id`)
+- [x] Fase 2: handle_album + _process_grok_album_after_delay + delete_status
+- [x] Fase 3: tests/test_album_batch.py con 11 tests
+- [x] /start menciona álbum + caption
+- [x] ./venv/bin/python -m pytest tests/ -q verde
+- [x] Sin cambios en sessions.py
+
+## Self-check: PASSED
