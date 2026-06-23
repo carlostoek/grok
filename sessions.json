@@ -3,7 +3,7 @@
     "source_path": "/home/ubuntu/repos/grok/sources/6181290784.jpg",
     "state": "IDLE",
     "model": "grok",
-    "grok_imagine_provider": "xai",
+    "grok_imagine_provider": "kie",
     "grok_imagine_variant": "standard",
     "video_duration": 5,
     "video_aspect_ratio": "9:16",

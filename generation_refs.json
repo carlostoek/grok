@@ -532,5 +532,41 @@
       "imagine_variant": "quality",
       "source_file_id": "AgACAgEAAxkDAAIXj2o5VBQuvFCtPV0Ul6AGLes4VtDSAAI7DGsbCCzJRT9nk0ySWB5DAQADAgADeQADPAQ"
     }
+  },
+  "6181290784:6061": {
+    "provider": "kie",
+    "kind": "image",
+    "prompt": "iluminaci\u00f3n  candid, toma amateur, situaci\u00f3n espont\u00e1nea, vibra non-staged\nTransform this photo and ensure you have balanced whites, maintaining a uniform and natural pigment variation without overexposing the saturation. If the scene has a strong exposure of human skin, include visible pores, sporadic and faint micro-hairs, and subtle, sporadic, and very subtle imperfections, but don't force the exposure if they aren't present. Introduce shadows and micro-shadows that adapt to the textures, edge",
+    "created_at": 1782188453.4603982,
+    "kie_task_id": "1d467b69a24835739a1e7dd1e195d40e",
+    "kie_index": 0,
+    "regen": {
+      "mode": "edit",
+      "model_key": "grok",
+      "user_id": 6181290784,
+      "prompt": "iluminaci\u00f3n  candid, toma amateur, situaci\u00f3n espont\u00e1nea, vibra non-staged\nTransform this photo and ensure you have balanced whites, maintaining a uniform and natural pigment variation without overexposing the saturation. If the scene has a strong exposure of human skin, include visible pores, sporadic and faint micro-hairs, and subtle, sporadic, and very subtle imperfections, but don't force the exposure if they aren't present. Introduce shadows and micro-shadows that adapt to the textures, edges, and folds. Avoid excessive highlights, sharp angles, and shadows that make the skin look artificial.. The lighting must be candid soft, neutral, and natural, similar to the light of a cloudy day or a window, without cinematic drama, beauty lighting, or harsh shadows.",
+      "provider": "kie",
+      "imagine_provider": "kie",
+      "imagine_variant": "standard",
+      "source_file_id": "AgACAgEAAxkBAAIXq2o6CZJ8M6szy_9pmFwYVUeMvvyrAALzC2sbKX7QRbQ8SPHP4stUAQADAgADeQADPAQ"
+    }
+  },
+  "6181290784:6064": {
+    "provider": "kie",
+    "kind": "image",
+    "prompt": "Enhance this candid photography with realistic micro-details visibles, very fine pores, subtle skin pigment variations. The fabric of her outfit has micro-definition of the  texture, with realistic cloth tension lines and folds.  casting soft, anatomically accurate shadows and highlights on all surfaces. Improve depth and definition in facial features. With ultra candid illumination from a Window highlights remain untinted. Improves midtone contrast, recovers details in highlights and shadows, a",
+    "created_at": 1782189570.1844049,
+    "kie_task_id": "7e913a7379e6fcf6cbc66da833512aa0",
+    "kie_index": 0,
+    "regen": {
+      "mode": "edit",
+      "model_key": "grok",
+      "user_id": 6181290784,
+      "prompt": "Enhance this candid photography with realistic micro-details visibles, very fine pores, subtle skin pigment variations. The fabric of her outfit has micro-definition of the  texture, with realistic cloth tension lines and folds.  casting soft, anatomically accurate shadows and highlights on all surfaces. Improve depth and definition in facial features. With ultra candid illumination from a Window highlights remain untinted. Improves midtone contrast, recovers details in highlights and shadows, and slightly increases the vibrancy of colors to make them look vibrant with DLSR - quality colour and detail, using an advanced upscaling algorithm comparable to the results from canon EOS R6 II, maintain authentic photographic quality.",
+      "provider": "kie",
+      "imagine_provider": "kie",
+      "imagine_variant": "standard",
+      "source_file_id": "AgACAgEAAxkBAAIXq2o6CZJ8M6szy_9pmFwYVUeMvvyrAALzC2sbKX7QRbQ8SPHP4stUAQADAgADeQADPAQ"
+    }
   }
 }
