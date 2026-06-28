@@ -942,6 +942,38 @@ async def test_cfg_provider_grok_video_activates_model(sessions_file, mock_confi
 
 
 @pytest.mark.asyncio
+async def test_model_switch_clears_long_prompt_collection(sessions_file, mock_config_safe_edit):
+    uid = 7029
+    user_state = bot.get_user_state(uid)
+    user_state["model"] = "grok"
+    user_state["pending_prompt"] = "pending text"
+    bot._set_long_prompt_collection(
+        user_state,
+        file_ids=["p1", "p2"],
+        integrate_mode=True,
+        is_video=False,
+    )
+
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "cfg:model:grok_video"
+    callback.message = MagicMock()
+    callback.answer = AsyncMock()
+    state = make_fsm_context(
+        fsm_state=_state_key(config_flow.ConfigStates.select_model),
+    )
+
+    await bot.handle_cfg_model(callback, state)
+
+    assert user_state["pending_prompt"] is None
+    assert user_state["awaiting_long_prompt_text"] is False
+    assert user_state["pending_edit_file_ids"] is None
+    assert user_state["pending_edit_integrate_mode"] is False
+    assert user_state["pending_edit_is_video"] is False
+    assert user_state["model"] == "grok_video"
+
+
+@pytest.mark.asyncio
 async def test_cfg_rejects_non_private_group(sessions_file):
     msg = MagicMock()
     msg.from_user.id = 8200

@@ -38,14 +38,14 @@ async def test_photo_no_caption_grok_video_help():
 async def test_text_prompt_too_long_rejected():
     msg = MagicMock()
     msg.from_user.id = 9002
-    msg.text = "x" * (bot.MAX_PROMPT_LEN + 5)
+    msg.text = "x" * (bot.TELEGRAM_MAX_TEXT_LEN + 5)
     msg.reply_to_message = None
     msg.answer = AsyncMock()
     bot.get_user_state(9002)["model"] = "grok_video"
 
     await bot.handle_text(msg)
 
-    assert str(bot.MAX_PROMPT_LEN) in msg.answer.await_args.args[0]
+    assert str(bot.TELEGRAM_MAX_TEXT_LEN) in msg.answer.await_args.args[0]
 
 
 @pytest.mark.asyncio

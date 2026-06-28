@@ -5,6 +5,7 @@ import base64
 import html
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -48,9 +49,13 @@ def _parse_allowed_telegram_ids() -> set[int] | None:
 
 
 ALLOWED_TELEGRAM_IDS = _parse_allowed_telegram_ids()
-MAX_PROMPT_LEN = 1000
+TELEGRAM_MAX_CAPTION_LEN = 1024
+TELEGRAM_CAPTION_COLLECT_THRESHOLD = 1020
+TELEGRAM_MAX_TEXT_LEN = 4096
 
 SOURCES_DIR = Path(__file__).parent / "sources"
+INTEGRATE_REFS_DIR = Path(__file__).parent / "integrate_refs"
+INTEGRATE_MAX_ALBUM = 10
 
 # --- Model Registry ---
 MODELS = {
@@ -148,7 +153,9 @@ KIE_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SEC)
 
 # Per-user in-memory cache (hydrated from sessions.py persistence on first access).
 # Keys: model (top-level), grok_imagine_provider + grok_imagine_variant (granular Imagine config),
-#       source_path, fs_state, pending_prompt.
+#       source_path, fs_state, pending_prompt,
+#       awaiting_long_prompt_text, pending_edit_file_ids,
+#       pending_edit_integrate_mode, pending_edit_is_video.
 # Model, provider, and model-specific settings are configured via the unified /config FSM
 # (/config, /model, /imagine, /imaginess, /video).
 user_state: dict[int, dict] = {}
@@ -236,12 +243,129 @@ def _is_generation_prompt_message(message: types.Message) -> bool:
     )
 
 
-def _validate_prompt(prompt: str) -> str | None:
+def _validate_prompt(prompt: str, *, max_len: int = TELEGRAM_MAX_TEXT_LEN) -> str | None:
     if len(prompt) < 3:
         return "El prompt es muy corto. Dame algo mas descriptivo."
-    if len(prompt) > MAX_PROMPT_LEN:
-        return f"El prompt es demasiado largo (máximo {MAX_PROMPT_LEN} caracteres)."
+    if len(prompt) > max_len:
+        return f"El prompt es demasiado largo (máximo {max_len} caracteres)."
     return None
+
+
+def _format_result_caption(prefix: str, prompt: str) -> str:
+    header = f"<b>{prefix}:</b> "
+    ellipsis = "…"
+    max_len = TELEGRAM_MAX_CAPTION_LEN
+    if len(header) >= max_len:
+        return header[:max_len]
+
+    budget = max_len - len(header)
+    escaped_full = _escape_prompt(prompt)
+    if len(escaped_full) <= budget:
+        return f"{header}{escaped_full}"
+
+    if budget <= len(ellipsis):
+        return f"{header}{ellipsis[:budget]}"
+
+    content_budget = budget - len(ellipsis)
+    lo, hi = 0, len(prompt)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if len(_escape_prompt(prompt[:mid])) <= content_budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    truncated = _escape_prompt(prompt[:best]) + ellipsis
+    return f"{header}{truncated}"
+
+
+def _parse_integrate_caption(caption: str) -> tuple[bool, str]:
+    """Return (integrate_mode, prompt) stripping leading /s trigger from caption."""
+    text = caption.strip()
+    if not text.startswith("/s"):
+        return False, text
+    prompt = re.sub(r"^/s(?:\s+|$)", "", text, count=1).strip()
+    return True, prompt
+
+
+def _prompt_needs_long_text_collection(prompt: str) -> bool:
+    return len(prompt) > TELEGRAM_CAPTION_COLLECT_THRESHOLD
+
+
+def _set_long_prompt_collection(
+    state: dict,
+    *,
+    file_ids: list[str],
+    integrate_mode: bool,
+    is_video: bool,
+) -> None:
+    state["pending_prompt"] = None
+    state["awaiting_long_prompt_text"] = True
+    state["pending_edit_file_ids"] = file_ids
+    state["pending_edit_integrate_mode"] = integrate_mode
+    state["pending_edit_is_video"] = is_video
+
+
+def _clear_long_prompt_collection(state: dict) -> None:
+    state["awaiting_long_prompt_text"] = False
+    state["pending_edit_file_ids"] = None
+    state["pending_edit_integrate_mode"] = False
+    state["pending_edit_is_video"] = False
+
+
+def _is_awaiting_long_prompt_text(state: dict) -> bool:
+    return bool(state.get("awaiting_long_prompt_text"))
+
+
+async def _long_prompt_collection_reply(
+    message: types.Message,
+    *,
+    is_video: bool,
+    n_photos: int,
+) -> None:
+    if is_video:
+        action = "animar la imagen"
+    elif n_photos > 1:
+        action = "editar las imágenes"
+    else:
+        action = "editar la imagen"
+    album_note = ""
+    if n_photos > 1:
+        album_note = f"\n\nHe guardado tus {n_photos} fotos del álbum."
+    await message.answer(
+        "El caption es demasiado largo para procesarlo directamente.\n\n"
+        f"Envíame el prompt como <b>mensaje de texto</b> para {action}.{album_note}",
+        parse_mode="HTML",
+    )
+
+
+def _integrate_ref_path(user_id: int) -> Path | None:
+    path = sessions.get_session(user_id).get("integrate_ref_path")
+    if not path:
+        return None
+    ref_path = Path(path)
+    return ref_path if ref_path.exists() else None
+
+
+def _load_integrate_ref_bytes(user_id: int) -> tuple[BytesIO | None, str | None]:
+    ref_path = _integrate_ref_path(user_id)
+    if ref_path is None:
+        return None, (
+            "No hay imagen de referencia configurada. "
+            "Usa /cambiar_referencia para establecerla."
+        )
+    return BytesIO(ref_path.read_bytes()), None
+
+
+def _validate_integrate_prerequisites(model: dict, user_id: int) -> tuple[BytesIO | None, str | None]:
+    if model.get("provider") != "xai":
+        return None, (
+            "La edición con referencia (/s) requiere el proveedor "
+            "<b>xAI (oficial)</b>. Cambialo en /config."
+        )
+    return _load_integrate_ref_bytes(user_id)
 
 
 def _detect_image_mime(image_data: BytesIO) -> tuple[str, str]:
@@ -380,6 +504,7 @@ def _build_image_regen_context(
     mode: str,
     source_file_id: str | None = None,
     kie_source_ref: dict | None = None,
+    integrate_mode: bool = False,
 ) -> dict:
     ctx: dict = {
         "mode": mode,
@@ -399,6 +524,8 @@ def _build_image_regen_context(
             "task_id": kie_source_ref["task_id"],
             "index": kie_source_ref.get("index", 0),
         }
+    if integrate_mode:
+        ctx["integrate_mode"] = True
     return ctx
 
 
@@ -424,8 +551,14 @@ def get_user_state(user_id: int) -> dict:
             "grok_imagine_provider": persisted.get("grok_imagine_provider", sessions.DEFAULT_GROK_IMAGINE_PROVIDER),
             "grok_imagine_variant": persisted.get("grok_imagine_variant", sessions.DEFAULT_GROK_IMAGINE_VARIANT),
             "source_path": persisted.get("source_path"),
+            "integrate_ref_path": persisted.get("integrate_ref_path"),
             "fs_state": persisted.get("state", sessions.FsState.IDLE),
+            "integrate_ref_awaiting": False,
             "pending_prompt": None,
+            "awaiting_long_prompt_text": False,
+            "pending_edit_file_ids": None,
+            "pending_edit_integrate_mode": False,
+            "pending_edit_is_video": False,
         }
     return user_state[user_id]
 
@@ -582,6 +715,8 @@ async def cmd_start(message: types.Message):
             "Tambien puedes enviar una <b>foto con caption</b> para editarla o animarla:\n",
             "la IA tomara tu imagen y aplicara los cambios que describas en el caption.\n",
             "Tambien puedes enviar un <b>album de fotos con caption</b> para editarlas todas con el mismo prompt.\n",
+            "Para combinar una imagen fija con cada foto del album, usa /cambiar_referencia "
+            "y pon <b>/s</b> al inicio del caption (requiere proveedor xAI en /config).\n",
         ]
 
     lines.append(f"Modelo actual: <b>{model['name']}</b>\n")
@@ -740,12 +875,24 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
 
     status_msg = await callback.message.answer(f"Regenerando imagen con {model['name']}...")
     image_data = None
+    reference_image = None
     kie_source_ref = regen.get("kie_source_ref")
     source_file_id = regen.get("source_file_id")
+    integrate_mode = bool(regen.get("integrate_mode"))
 
     try:
         if mode == "edit" and not kie_source_ref:
-            if source_file_id:
+            if integrate_mode:
+                if source_file_id:
+                    image_data = await _download_telegram_file_id(source_file_id)
+                else:
+                    await status_msg.edit_text("No se pudo recuperar la imagen original para regenerar.")
+                    return
+                reference_image, ref_err = _load_integrate_ref_bytes(regen["user_id"])
+                if ref_err:
+                    await status_msg.edit_text(ref_err)
+                    return
+            elif source_file_id:
                 image_data = await _download_telegram_file_id(source_file_id)
             else:
                 await status_msg.edit_text("No se pudo recuperar la imagen original para regenerar.")
@@ -755,6 +902,7 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
             model,
             prompt,
             image_data,
+            reference_image=reference_image,
             kie_source_ref=kie_source_ref,
         )
         if err:
@@ -799,6 +947,30 @@ async def cmd_cambiar_source(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# /cambiar_referencia  (solo grok — imagen fija para edición /s)
+# ---------------------------------------------------------------------------
+@dp.message(Command("cambiar_referencia"))
+async def cmd_cambiar_referencia(message: types.Message):
+    state = get_user_state(message.from_user.id)
+    if state["model"] != "grok":
+        await message.answer(
+            "Este comando solo esta disponible en modo <b>Grok Imagine</b>.\n"
+            "Usa /config para cambiar al modo Grok Imagine.",
+            parse_mode="HTML",
+        )
+        return
+
+    state["integrate_ref_awaiting"] = True
+    await message.answer(
+        "Envia la foto que sera tu <b>referencia fija</b>.\n\n"
+        "Luego, en un album (o foto) con caption que empiece por <b>/s</b>, "
+        "cada imagen se editara junto con esta referencia.\n"
+        "Requiere proveedor <b>xAI (oficial)</b> en /config.",
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------------------
 # /estado
 # ---------------------------------------------------------------------------
 @dp.message(Command("estado"))
@@ -823,6 +995,10 @@ async def cmd_estado(message: types.Message):
             prov_labels = {"xai": "xAI (oficial)", "replicate": "Replicate", "kie": "Kie.ai"}
             prov_label = prov_labels.get(prov, prov)
             lines.append(f"API / Backend: {prov_label} • {var_label}\n")
+            has_ref = _integrate_ref_path(message.from_user.id) is not None
+            lines.append(
+                f"Referencia integrate (/s): {'Configurada' if has_ref else 'No configurada'}\n"
+            )
             lines.append("Listo para generar/editar imagenes.")
         elif model.get("key") == "grok_video":
             uid = message.from_user.id
@@ -855,6 +1031,10 @@ async def handle_text(message: types.Message):
         return
 
     state = get_user_state(message.from_user.id)
+
+    if _is_awaiting_long_prompt_text(state):
+        await _complete_long_prompt_collection(message, message.text.strip())
+        return
 
     if state["model"] == "faceswap":
         if state["source_path"]:
@@ -943,7 +1123,7 @@ async def _do_generate_video(
     status_msg: types.Message | None = None,
     reply_message: types.Message | None = None,
     kie_source_ref: dict | None = None,
-):
+) -> bool:
     uid = user_id if user_id is not None else message.from_user.id
     reply_msg = reply_message or message
 
@@ -955,7 +1135,7 @@ async def _do_generate_video(
                     await status_msg.edit_text(size_err)
                 else:
                     await reply_msg.answer(size_err)
-                return
+                return False
 
         if status_msg is None:
             video_model = sessions.get_video_config(uid)["model"]
@@ -978,7 +1158,7 @@ async def _do_generate_video(
         )
         if err:
             await status_msg.edit_text(err)
-            return
+            return False
         prefix = "Edit" if image_data or kie_source_ref else "Prompt"
         await process_video_result(
             output,
@@ -988,49 +1168,57 @@ async def _do_generate_video(
             prefix,
             download_allowlist=_download_allowlist_for_provider(model.get("provider")),
         )
+        return True
     except Exception as e:
         print(f"[video] unexpected error user={uid}: {e}")
         if status_msg:
             await status_msg.edit_text("Error inesperado. Intenta de nuevo.")
         else:
             await reply_msg.answer("Error inesperado. Intenta de nuevo.")
+        return False
 
 
-# ---------------------------------------------------------------------------
-# PHOTO + CAPTION  — route by model
-# ---------------------------------------------------------------------------
-@dp.message(lambda m: m.photo and m.caption and not m.media_group_id)
-async def handle_photo_caption(message: types.Message):
-    state = get_user_state(message.from_user.id)
-
-    # --- faceswap: photo + caption (caption ignored, just do swap) ---
-    if state["model"] == "faceswap":
-        await _handle_faceswap_photo(message)
-        return
-
-    # --- grok / grok_video / seedream: photo + caption → edit or image-to-video ---
-    prompt = message.caption.strip()
-    prompt_err = _validate_prompt(prompt)
-    if prompt_err:
-        await message.answer(prompt_err)
-        return
-
-    model = get_model(message.from_user.id)
+async def _process_single_photo_edit(
+    message: types.Message,
+    prompt: str,
+    file_id: str,
+    *,
+    integrate_mode: bool = False,
+    is_video: bool = False,
+    user_id: int | None = None,
+) -> bool:
+    uid = user_id if user_id is not None else message.from_user.id
+    model = get_model(uid)
     status_msg = None
 
     try:
-        image_data = await _download_telegram_photo(message.photo[-1])
+        image_data = await _download_telegram_file_id(file_id)
 
-        if model["key"] == "grok_video":
-            await _do_generate_video(message, model, prompt, image_data, user_id=message.from_user.id)
-            return
+        if is_video:
+            return await _do_generate_video(message, model, prompt, image_data, user_id=uid)
 
-        status_msg = await message.answer(f"Editando imagen con {model['name']}...")
-        backend = _prov_label(model.get("provider", "?"))
-        output, err, kie_meta = await generate_image(model, prompt, image_data)
+        reference_image = None
+        if integrate_mode:
+            reference_image, prereq_err = _validate_integrate_prerequisites(model, uid)
+            if prereq_err:
+                await message.answer(prereq_err, parse_mode="HTML")
+                return False
+
+        status_label = (
+            "Editando imagen (referencia+foto)..."
+            if integrate_mode
+            else f"Editando imagen con {model['name']}..."
+        )
+        status_msg = await message.answer(status_label)
+        output, err, kie_meta = await generate_image(
+            model,
+            prompt,
+            image_data,
+            reference_image=reference_image,
+        )
         if err:
             await status_msg.edit_text(err)
-            return
+            return False
         await process_image_result(
             output,
             prompt,
@@ -1041,23 +1229,213 @@ async def handle_photo_caption(message: types.Message):
             kie_meta=kie_meta,
             regen_context=_build_image_regen_context(
                 model=model,
-                user_id=message.from_user.id,
+                user_id=uid,
                 prompt=prompt,
                 mode="edit",
-                source_file_id=message.photo[-1].file_id,
+                source_file_id=file_id,
+                integrate_mode=integrate_mode,
             ),
         )
+        return True
     except replicate.exceptions.ReplicateError as e:
         backend = _prov_label(model.get("provider", "?"))
         if status_msg:
             await status_msg.edit_text(f"Error de {backend}: {e}")
         else:
             await message.answer(f"Error de {backend}: {e}")
+        return False
     except Exception as e:
         if status_msg:
             await status_msg.edit_text(f"Error inesperado: {e}")
         else:
             await message.answer(f"Error inesperado: {e}")
+        return False
+
+
+async def _process_album_edit_from_file_ids(
+    anchor_message: types.Message,
+    prompt: str,
+    file_ids: list[str],
+    *,
+    integrate_mode: bool = False,
+    user_id: int | None = None,
+) -> bool:
+    uid = user_id if user_id is not None else anchor_message.from_user.id
+    model = get_model(uid)
+    n = len(file_ids)
+    backend = _prov_label(model.get("provider", "?"))
+    status_msg = None
+    reference_image = None
+
+    if integrate_mode:
+        reference_image, prereq_err = _validate_integrate_prerequisites(model, uid)
+        if prereq_err:
+            await anchor_message.answer(prereq_err, parse_mode="HTML")
+            return False
+
+    try:
+        if integrate_mode:
+            status_msg = await anchor_message.reply(
+                f"Integrando referencia 0/{n} imágenes ({backend})..."
+            )
+        else:
+            status_msg = await anchor_message.reply(
+                f"Editando 0/{n} imágenes con {model['name']} ({backend})..."
+            )
+
+        for i, file_id in enumerate(file_ids, 1):
+            if integrate_mode:
+                await status_msg.edit_text(
+                    f"Integrando referencia {i}/{n} imágenes ({backend})..."
+                )
+            else:
+                await status_msg.edit_text(
+                    f"Editando {i}/{n} imágenes con {model['name']} ({backend})..."
+                )
+            image_data = await _download_telegram_file_id(file_id)
+            output, err, kie_meta = await generate_image(
+                model,
+                prompt,
+                image_data,
+                reference_image=reference_image,
+            )
+            if err:
+                await status_msg.edit_text(
+                    f"{i - 1}/{n} completadas; error en imagen {i}: {err}"
+                )
+                return False
+            await process_image_result(
+                output,
+                prompt,
+                status_msg,
+                anchor_message,
+                "Edit",
+                delete_status=False,
+                download_allowlist=_download_allowlist_for_provider(model.get("provider")),
+                kie_meta=kie_meta,
+                regen_context=_build_image_regen_context(
+                    model=model,
+                    user_id=uid,
+                    prompt=prompt,
+                    mode="edit",
+                    source_file_id=file_id,
+                    integrate_mode=integrate_mode,
+                ),
+            )
+        else:
+            await status_msg.edit_text(f"Completadas {n}/{n} imágenes.")
+        return True
+
+    except replicate.exceptions.ReplicateError as e:
+        if status_msg:
+            await status_msg.edit_text(f"Error de {backend}: {e}")
+        else:
+            await anchor_message.answer(f"Error de {backend}: {e}")
+        return False
+    except Exception as e:
+        if status_msg:
+            await status_msg.edit_text(f"Error inesperado: {e}")
+        else:
+            await anchor_message.answer(f"Error inesperado: {e}")
+        return False
+
+
+async def _complete_long_prompt_collection(message: types.Message, prompt: str) -> bool:
+    state = get_user_state(message.from_user.id)
+    if not _is_awaiting_long_prompt_text(state):
+        return False
+
+    prompt_err = _validate_prompt(prompt)
+    if prompt_err:
+        await message.answer(prompt_err)
+        return True
+
+    file_ids = state.get("pending_edit_file_ids") or []
+    if not file_ids:
+        await message.answer(
+            "No hay fotos guardadas para editar. Vuelve a enviar la imagen con caption largo."
+        )
+        return True
+
+    integrate_mode = state.get("pending_edit_integrate_mode", False)
+    is_video = state.get("pending_edit_is_video", False)
+
+    success = False
+    if is_video and len(file_ids) == 1:
+        success = await _process_single_photo_edit(
+            message,
+            prompt,
+            file_ids[0],
+            integrate_mode=integrate_mode,
+            is_video=True,
+        )
+    elif len(file_ids) == 1:
+        success = await _process_single_photo_edit(
+            message,
+            prompt,
+            file_ids[0],
+            integrate_mode=integrate_mode,
+        )
+    else:
+        success = await _process_album_edit_from_file_ids(
+            message,
+            prompt,
+            file_ids,
+            integrate_mode=integrate_mode,
+        )
+
+    if success:
+        _clear_long_prompt_collection(state)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# PHOTO + CAPTION  — route by model
+# ---------------------------------------------------------------------------
+@dp.message(lambda m: m.photo and m.caption and not m.media_group_id)
+async def handle_photo_caption(message: types.Message):
+    if isinstance(message.media_group_id, str) and message.media_group_id:
+        return
+
+    state = get_user_state(message.from_user.id)
+
+    if state.get("integrate_ref_awaiting"):
+        await _handle_integrate_ref_photo(message)
+        return
+
+    # --- faceswap: photo + caption (caption ignored, just do swap) ---
+    if state["model"] == "faceswap":
+        await _handle_faceswap_photo(message)
+        return
+
+    # --- grok / grok_video / seedream: photo + caption → edit or image-to-video ---
+    integrate_mode, prompt = _parse_integrate_caption(message.caption)
+    if _prompt_needs_long_text_collection(prompt):
+        model = get_model(message.from_user.id)
+        is_video = model["key"] == "grok_video"
+        _set_long_prompt_collection(
+            state,
+            file_ids=[message.photo[-1].file_id],
+            integrate_mode=integrate_mode,
+            is_video=is_video,
+        )
+        await _long_prompt_collection_reply(message, is_video=is_video, n_photos=1)
+        return
+
+    prompt_err = _validate_prompt(prompt)
+    if prompt_err:
+        await message.answer(prompt_err)
+        return
+
+    _clear_long_prompt_collection(state)
+    model = get_model(message.from_user.id)
+    await _process_single_photo_edit(
+        message,
+        prompt,
+        message.photo[-1].file_id,
+        integrate_mode=integrate_mode,
+        is_video=(model["key"] == "grok_video"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1067,8 +1445,20 @@ async def handle_photo_caption(message: types.Message):
 async def handle_photo_no_caption(message: types.Message):
     state = get_user_state(message.from_user.id)
 
+    if state.get("integrate_ref_awaiting"):
+        await _handle_integrate_ref_photo(message)
+        return
+
     if state["model"] == "faceswap":
         await _handle_faceswap_photo(message)
+        return
+
+    if _is_awaiting_long_prompt_text(state):
+        await message.answer(
+            "Tienes una edición pendiente. Envíame el prompt como <b>mensaje de texto</b> "
+            "(no hace falta responder a ningún mensaje).",
+            parse_mode="HTML",
+        )
         return
 
     # grok / grok_video / seedream
@@ -1088,11 +1478,18 @@ async def handle_photo_no_caption(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
-# REPLY to photo (text reply to an image) — route by model
+# REPLY messages — long-prompt collection or photo edit
 # ---------------------------------------------------------------------------
-@dp.message(lambda m: m.text and m.reply_to_message and m.reply_to_message.photo)
+@dp.message(lambda m: m.text and m.reply_to_message)
 async def handle_reply_edit(message: types.Message):
     state = get_user_state(message.from_user.id)
+
+    if _is_awaiting_long_prompt_text(state):
+        await _complete_long_prompt_collection(message, message.text.strip())
+        return
+
+    if not message.reply_to_message.photo:
+        return
 
     if state["model"] == "faceswap":
         await message.answer(
@@ -1194,6 +1591,10 @@ async def handle_album(message: types.Message):
     state = get_user_state(message.from_user.id)
     model_key = state["model"]
 
+    if state.get("integrate_ref_awaiting"):
+        await _handle_integrate_ref_photo(message)
+        return
+
     if model_key not in ("faceswap", "grok"):
         return
 
@@ -1241,13 +1642,35 @@ async def _process_grok_album_after_delay(cache_key: tuple, first_msg: types.Mes
 
     messages = sorted(messages, key=lambda m: m.message_id)
     n = len(messages)
+    if n > INTEGRATE_MAX_ALBUM:
+        await first_msg.answer(
+            f"El album tiene {n} fotos; el maximo es {INTEGRATE_MAX_ALBUM}."
+        )
+        return
 
-    prompt = _album_prompt(messages)
-    if not prompt:
+    raw_caption = _album_prompt(messages)
+    if not raw_caption:
         await first_msg.answer(
             "Para editar una imagen, enviala con un <b>caption</b> describiendo los cambios que quieres.\n\n"
             "Ejemplo: envia tu foto con el texto <i>\"cambia el fondo a una playa al atardecer\"</i>",
             parse_mode="HTML",
+        )
+        return
+
+    integrate_mode, prompt = _parse_integrate_caption(raw_caption)
+    if _prompt_needs_long_text_collection(prompt):
+        file_ids = [msg.photo[-1].file_id for msg in messages if msg.photo]
+        state = get_user_state(first_msg.from_user.id)
+        _set_long_prompt_collection(
+            state,
+            file_ids=file_ids,
+            integrate_mode=integrate_mode,
+            is_video=False,
+        )
+        await _long_prompt_collection_reply(
+            first_msg,
+            is_video=False,
+            n_photos=len(file_ids),
         )
         return
 
@@ -1256,56 +1679,15 @@ async def _process_grok_album_after_delay(cache_key: tuple, first_msg: types.Mes
         await first_msg.answer(prompt_err)
         return
 
-    model = get_model(first_msg.from_user.id)
-    backend = _prov_label(model.get("provider", "?"))
-    status_msg = None
-
-    try:
-        status_msg = await first_msg.reply(
-            f"Editando 0/{n} imágenes con {model['name']} ({backend})..."
-        )
-
-        for i, msg in enumerate(messages, 1):
-            await status_msg.edit_text(
-                f"Editando {i}/{n} imágenes con {model['name']} ({backend})..."
-            )
-            image_data = await _download_telegram_photo(msg.photo[-1])
-            output, err, kie_meta = await generate_image(model, prompt, image_data)
-            if err:
-                await status_msg.edit_text(
-                    f"{i - 1}/{n} completadas; error en imagen {i}: {err}"
-                )
-                break
-            await process_image_result(
-                output,
-                prompt,
-                status_msg,
-                first_msg,
-                "Edit",
-                delete_status=False,
-                download_allowlist=_download_allowlist_for_provider(model.get("provider")),
-                kie_meta=kie_meta,
-                regen_context=_build_image_regen_context(
-                    model=model,
-                    user_id=first_msg.from_user.id,
-                    prompt=prompt,
-                    mode="edit",
-                    source_file_id=msg.photo[-1].file_id,
-                ),
-            )
-        else:
-            await status_msg.edit_text(f"Completadas {n}/{n} imágenes.")
-
-    except replicate.exceptions.ReplicateError as e:
-        if status_msg:
-            await status_msg.edit_text(f"Error de {backend}: {e}")
-        else:
-            await first_msg.answer(f"Error de {backend}: {e}")
-    except Exception as e:
-        if status_msg:
-            await status_msg.edit_text(f"Error inesperado: {e}")
-        else:
-            await first_msg.answer(f"Error inesperado: {e}")
+    state = get_user_state(first_msg.from_user.id)
+    _clear_long_prompt_collection(state)
+    file_ids = [msg.photo[-1].file_id for msg in messages if msg.photo]
+    await _process_album_edit_from_file_ids(
+        first_msg,
+        prompt,
+        file_ids,
+        integrate_mode=integrate_mode,
+    )
 
 
 async def _process_album_after_delay(cache_key: tuple, chat_id: int, first_msg: types.Message):
@@ -1442,6 +1824,27 @@ async def _handle_faceswap_source_photo(message: types.Message):
     await message.answer("Source actualizado. Ahora envia tus fotos para hacer face swap.")
 
 
+async def _handle_integrate_ref_photo(message: types.Message):
+    file_id = message.photo[-1].file_id
+    INTEGRATE_REFS_DIR.mkdir(parents=True, exist_ok=True)
+    ref_path = INTEGRATE_REFS_DIR / f"{message.from_user.id}.jpg"
+
+    file = await bot.get_file(file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    ref_path.write_bytes(file_bytes.read())
+
+    state = get_user_state(message.from_user.id)
+    state["integrate_ref_path"] = str(ref_path)
+    state["integrate_ref_awaiting"] = False
+    sessions.set_integrate_ref(message.from_user.id, str(ref_path))
+
+    await message.answer(
+        "Referencia actualizada. En un album o foto con caption que empiece por "
+        "<b>/s</b>, cada imagen se editara junto con esta referencia.",
+        parse_mode="HTML",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Replicate face swap batch (sync wrapper around replicate.run)
 # ---------------------------------------------------------------------------
@@ -1498,16 +1901,20 @@ async def generate_image(
     prompt: str,
     image_data: BytesIO | None = None,
     *,
+    reference_image: BytesIO | None = None,
     kie_source_ref: dict | None = None,
 ) -> tuple[object | None, str | None, dict | None]:
     prov = model.get("provider", "?")
     model_id = model.get("id")
     print(
         f"[generate] key={model.get('key')} provider={prov} id={model_id} "
-        f"has_image={image_data is not None} kie_ref={kie_source_ref is not None}"
+        f"has_image={image_data is not None} has_ref={reference_image is not None} "
+        f"kie_ref={kie_source_ref is not None}"
     )
     if prov == "xai":
-        output, err = await _generate_xai(model, prompt, image_data)
+        output, err = await _generate_xai(
+            model, prompt, image_data, reference_image=reference_image
+        )
         return output, err, None
     if prov == "kie":
         return await _generate_kie(model, prompt, image_data, kie_source_ref=kie_source_ref)
@@ -1536,13 +1943,33 @@ async def _generate_replicate(model: dict, prompt: str, image_data: BytesIO | No
 XAI_BASE = "https://api.x.ai/v1"
 
 
-async def _generate_xai(model: dict, prompt: str, image_data: BytesIO | None = None) -> tuple[object | None, str | None]:
+async def _generate_xai(
+    model: dict,
+    prompt: str,
+    image_data: BytesIO | None = None,
+    *,
+    reference_image: BytesIO | None = None,
+) -> tuple[object | None, str | None]:
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    if image_data:
+    if image_data and reference_image:
+        for img in (image_data, reference_image):
+            size_err = _validate_image_for_i2v(img)
+            if size_err:
+                return None, size_err
+        body = {
+            "model": model["id"],
+            "prompt": prompt,
+            "images": [
+                {"url": _image_to_data_uri(image_data), "type": "image_url"},
+                {"url": _image_to_data_uri(reference_image), "type": "image_url"},
+            ],
+        }
+        url = f"{XAI_BASE}/images/edits"
+    elif image_data:
         size_err = _validate_image_for_i2v(image_data)
         if size_err:
             return None, size_err
@@ -1919,7 +2346,7 @@ async def process_image_result(
     photo = BufferedInputFile(image_bytes, filename="generated.png")
     sent_msg = await message.answer_photo(
         photo,
-        caption=f"<b>{prefix}:</b> {_escape_prompt(prompt)}",
+        caption=_format_result_caption(prefix, prompt),
         parse_mode="HTML",
         reply_markup=_image_regenerate_keyboard(),
     )
@@ -2270,7 +2697,6 @@ async def process_video_result(
         await status_msg.edit_text(dl_err)
         return
 
-    safe_prompt = _escape_prompt(prompt)
     if len(video_bytes) > TELEGRAM_MAX_VIDEO_BYTES:
         await status_msg.edit_text(
             f"El video es demasiado grande para Telegram ({len(video_bytes) // 1024 // 1024} MB).\n"
@@ -2282,7 +2708,7 @@ async def process_video_result(
     try:
         await message.answer_video(
             video,
-            caption=f"<b>{prefix}:</b> {safe_prompt}",
+            caption=_format_result_caption(prefix, prompt),
             parse_mode="HTML",
         )
         await status_msg.delete()

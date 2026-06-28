@@ -75,6 +75,23 @@ async def test_photo_caption_i2v_rejects_short_prompt():
 
 
 @pytest.mark.asyncio
+async def test_photo_caption_i2v_long_caption_triggers_collection():
+    long_caption = "x" * 1021
+    msg = _make_user_message(caption=long_caption, photo=[MagicMock(file_id="p1")])
+    bot.get_user_state(1001)["model"] = "grok_video"
+
+    with patch.object(bot, "_do_generate_video", new_callable=AsyncMock) as mock_gen:
+        await bot.handle_photo_caption(msg)
+
+    mock_gen.assert_not_called()
+    state = bot.get_user_state(1001)
+    assert state["awaiting_long_prompt_text"] is True
+    assert state["pending_edit_is_video"] is True
+    msg.answer.assert_awaited_once()
+    assert "mensaje de texto" in msg.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_photo_caption_i2v_calls_do_generate_video():
     msg = _make_user_message(caption="make the water flow gently", photo=[MagicMock(file_id="p1")])
     bot.get_user_state(1001)["model"] = "grok_video"
@@ -190,6 +207,12 @@ async def test_model_switch_clears_pending_prompt(sessions_file):
     user_state = bot.get_user_state(2002)
     user_state["model"] = "grok_video"
     user_state["pending_prompt"] = "stale prompt"
+    bot._set_long_prompt_collection(
+        user_state,
+        file_ids=["p1"],
+        integrate_mode=False,
+        is_video=True,
+    )
 
     from conftest import make_fsm_context
     import config_flow
@@ -201,4 +224,8 @@ async def test_model_switch_clears_pending_prompt(sessions_file):
     await bot.handle_cfg_model(callback, fsm_state)
 
     assert user_state["pending_prompt"] is None
+    assert user_state["awaiting_long_prompt_text"] is False
+    assert user_state["pending_edit_file_ids"] is None
+    assert user_state["pending_edit_integrate_mode"] is False
+    assert user_state["pending_edit_is_video"] is False
     assert user_state["model"] == "seedream"

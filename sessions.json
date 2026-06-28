@@ -21,7 +21,8 @@
       1781843079.275552
     ],
     "video_model": "grok-imagine-video-1.5",
-    "video_mode": "spicy"
+    "video_mode": "spicy",
+    "integrate_ref_path": "/home/ubuntu/repos/grok/integrate_refs/6181290784.jpg"
   },
   "1280444712": {
     "source_path": "/home/ubuntu/repos/grok/sources/1280444712.jpg",
@@ -38,7 +39,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "88": {
     "source_path": null,
@@ -85,7 +87,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "1003": {
     "source_path": null,
@@ -98,7 +101,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "222": {
     "source_path": null,
@@ -111,7 +115,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "3333": {
     "source_path": null,
@@ -135,7 +140,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "9002": {
     "source_path": null,
@@ -148,7 +154,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "9003": {
     "source_path": null,
@@ -194,7 +201,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "5104": {
     "source_path": null,
@@ -207,7 +215,8 @@
     "video_resolution": "720p",
     "video_hourly_timestamps": [],
     "video_model": "grok-imagine-video",
-    "video_mode": "normal"
+    "video_mode": "normal",
+    "integrate_ref_path": null
   },
   "501": {
     "source_path": null,
@@ -220,7 +229,8 @@
     "video_resolution": "720p",
     "video_model": "grok-imagine-video",
     "video_mode": "normal",
-    "video_hourly_timestamps": []
+    "video_hourly_timestamps": [],
+    "integrate_ref_path": null
   },
   "9201": {
     "source_path": null,
@@ -233,7 +243,8 @@
     "video_resolution": "720p",
     "video_model": "grok-imagine-video",
     "video_mode": "normal",
-    "video_hourly_timestamps": []
+    "video_hourly_timestamps": [],
+    "integrate_ref_path": null
   },
   "9202": {
     "source_path": null,
@@ -246,10 +257,26 @@
     "video_resolution": "720p",
     "video_model": "grok-imagine-video",
     "video_mode": "normal",
-    "video_hourly_timestamps": []
+    "video_hourly_timestamps": [],
+    "integrate_ref_path": null
   },
   "7034": {
     "source_path": null,
+    "state": "IDLE",
+    "model": "grok",
+    "grok_imagine_provider": "kie",
+    "grok_imagine_variant": "quality",
+    "video_duration": 5,
+    "video_aspect_ratio": "16:9",
+    "video_resolution": "720p",
+    "video_model": "grok-imagine-video",
+    "video_mode": "normal",
+    "video_hourly_timestamps": [],
+    "integrate_ref_path": null
+  },
+  "502": {
+    "source_path": null,
+    "integrate_ref_path": null,
     "state": "IDLE",
     "model": "grok",
     "grok_imagine_provider": "kie",

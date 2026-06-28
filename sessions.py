@@ -41,6 +41,7 @@ def _default_session_record(**overrides) -> dict:
     """Full session record with all persisted fields and sensible defaults."""
     rec = {
         "source_path": None,
+        "integrate_ref_path": None,
         "state": FsState.IDLE,
         "model": DEFAULT_MODEL,
         "grok_imagine_provider": DEFAULT_GROK_IMAGINE_PROVIDER,
@@ -108,6 +109,9 @@ def _ensure_full(rec: dict) -> bool:
     if "video_mode" not in rec:
         rec["video_mode"] = DEFAULT_VIDEO_MODE
         changed = True
+    if "integrate_ref_path" not in rec:
+        rec["integrate_ref_path"] = None
+        changed = True
     return changed
 
 
@@ -160,6 +164,7 @@ def set_source(user_id: int, source_path: str) -> None:
         prov = current["grok_provider"]
     sessions[uid] = {
         "source_path": source_path,
+        "integrate_ref_path": current.get("integrate_ref_path"),
         "state": FsState.IDLE,
         "model": model,
         "grok_imagine_provider": prov,
@@ -171,6 +176,19 @@ def set_source(user_id: int, source_path: str) -> None:
         "video_mode": current.get("video_mode", DEFAULT_VIDEO_MODE),
         "video_hourly_timestamps": current.get("video_hourly_timestamps", []),
     }
+    _save(sessions)
+
+
+def set_integrate_ref(user_id: int, integrate_ref_path: str) -> None:
+    """Persist Grok Imagine fixed reference image path for /s integrate edits."""
+    uid = str(user_id)
+    sessions = _load()
+    if uid not in sessions:
+        sessions[uid] = _default_session_record(integrate_ref_path=integrate_ref_path)
+    else:
+        rec = sessions[uid]
+        _ensure_full(rec)
+        rec["integrate_ref_path"] = integrate_ref_path
     _save(sessions)
 
 

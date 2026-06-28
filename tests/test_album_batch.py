@@ -98,7 +98,7 @@ async def test_grok_album_collects_messages(album_tasks, sessions_file):
     ]
 
     with patch.object(bot, "generate_image", new_callable=AsyncMock, return_value=([RESULT_URL], None, KIE_META)) as mock_gen:
-        with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+        with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
             with patch.object(bot, "process_image_result", new_callable=AsyncMock):
                 for msg in messages:
                     await bot.handle_album(msg)
@@ -120,7 +120,7 @@ async def test_grok_album_extracts_caption_from_first_message(album_tasks, sessi
     ]
 
     with patch.object(bot, "generate_image", new_callable=AsyncMock, return_value=([RESULT_URL], None, KIE_META)) as mock_gen:
-        with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+        with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
             with patch.object(bot, "process_image_result", new_callable=AsyncMock):
                 for msg in messages:
                     await bot.handle_album(msg)
@@ -166,7 +166,7 @@ async def test_grok_album_sequential_kie_calls(album_tasks, sessions_file):
 
     with patch.object(
         bot,
-        "_download_telegram_photo",
+        "_download_telegram_file_id",
         new_callable=AsyncMock,
         side_effect=image_payloads,
     ):
@@ -200,7 +200,7 @@ async def test_grok_album_kie_uses_upload_not_ref(album_tasks, sessions_file):
         _make_album_message(user_id=uid, message_id=51, file_id="p51"),
     ]
 
-    with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+    with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
         with patch.object(
             bot,
             "generate_image",
@@ -240,7 +240,7 @@ async def test_grok_album_saves_generation_ref_per_output(album_tasks, generatio
 
     messages[0].answer_photo = AsyncMock(side_effect=_answer_photo)
 
-    with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+    with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
         with patch.object(
             bot,
             "generate_image",
@@ -274,7 +274,7 @@ async def test_grok_album_stops_on_error(album_tasks, sessions_file):
         (None, "Kie task failed", None),
     ]
 
-    with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+    with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
         with patch.object(bot, "generate_image", new_callable=AsyncMock, side_effect=side_effects) as mock_gen:
             with patch.object(bot, "process_image_result", new_callable=AsyncMock):
                 for msg in messages:
@@ -323,7 +323,7 @@ async def test_grok_album_xai_provider(album_tasks, sessions_file):
         _make_album_message(user_id=uid, message_id=91, file_id="p91"),
     ]
 
-    with patch.object(bot, "_download_telegram_photo", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
+    with patch.object(bot, "_download_telegram_file_id", new_callable=AsyncMock, return_value=BytesIO(b"bytes")):
         with patch.object(
             bot,
             "generate_image",
@@ -338,6 +338,31 @@ async def test_grok_album_xai_provider(album_tasks, sessions_file):
     assert mock_gen.await_count == 2
     model = mock_gen.await_args_list[0].args[0]
     assert model["provider"] == "xai"
+
+
+@pytest.mark.asyncio
+async def test_grok_album_long_caption_triggers_collection(album_tasks, sessions_file):
+    uid = 1111
+    bot.get_user_state(uid)["model"] = "grok"
+    sessions.set_grok_imagine_config(uid, "kie", "standard")
+    long_caption = "x" * 1021
+
+    messages = [
+        _make_album_message(user_id=uid, message_id=101, caption=long_caption, file_id="p101"),
+        _make_album_message(user_id=uid, message_id=102, file_id="p102"),
+    ]
+
+    with patch.object(bot, "generate_image", new_callable=AsyncMock) as mock_gen:
+        for msg in messages:
+            await bot.handle_album(msg)
+        await _drain_album_tasks(album_tasks)
+
+    mock_gen.assert_not_called()
+    state = bot.get_user_state(uid)
+    assert state["awaiting_long_prompt_text"] is True
+    assert state["pending_edit_file_ids"] == ["p101", "p102"]
+    messages[0].answer.assert_awaited_once()
+    assert "mensaje de texto" in messages[0].answer.await_args.args[0]
 
 
 @pytest.mark.asyncio

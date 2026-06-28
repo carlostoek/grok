@@ -1273,6 +1273,41 @@ async def test_process_image_result_saves_generation_ref(generation_refs_file):
 
 
 @pytest.mark.asyncio
+async def test_process_image_result_truncates_caption_keeps_full_ref(generation_refs_file):
+    status_msg = MagicMock()
+    status_msg.delete = AsyncMock()
+    message = MagicMock()
+    message.chat.id = 201
+    sent = MagicMock()
+    sent.message_id = 100
+    message.answer_photo = AsyncMock(return_value=sent)
+    long_prompt = "n" * 3000
+    regen = bot._build_image_regen_context(
+        model={"key": "grok", "provider": "kie", "imagine_provider": "kie", "imagine_variant": "quality"},
+        user_id=502,
+        prompt=long_prompt,
+        mode="text",
+    )
+
+    with patch.object(bot, "download_url", new_callable=AsyncMock, return_value=(b"png", None)):
+        await bot.process_image_result(
+            [RESULT_URL],
+            long_prompt,
+            status_msg,
+            message,
+            "Prompt",
+            download_allowlist="kie",
+            kie_meta={"task_id": "task-long", "index": 0, "provider": "kie"},
+            regen_context=regen,
+        )
+
+    caption = message.answer_photo.await_args.kwargs["caption"]
+    assert len(caption) <= bot.TELEGRAM_MAX_CAPTION_LEN
+    ref = sessions.get_generation_ref(201, 100)
+    assert ref["regen"]["prompt"] == long_prompt
+
+
+@pytest.mark.asyncio
 async def test_handle_regenerate_image_text_mode(no_sleep, generation_refs_file):
     uid = 9201
     sessions.set_grok_imagine_config(uid, "kie", "standard")

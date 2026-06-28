@@ -66,6 +66,19 @@ async def test_success_sends_video_and_deletes_status():
 
 
 @pytest.mark.asyncio
+async def test_success_truncates_long_caption():
+    status_msg, message = _make_messages()
+    long_prompt = "z" * 3000
+    with patch.object(bot, "download_url", new_callable=AsyncMock, return_value=(VIDEO_BYTES, None)):
+        await bot.process_video_result(VIDEO_URL, long_prompt, status_msg, message, "Prompt")
+
+    message.answer_video.assert_awaited_once()
+    caption = message.answer_video.await_args.kwargs["caption"]
+    assert len(caption) <= bot.TELEGRAM_MAX_CAPTION_LEN
+    assert caption.endswith("…")
+
+
+@pytest.mark.asyncio
 async def test_telegram_send_failure_falls_back_to_url():
     status_msg, message = _make_messages()
     message.answer_video.side_effect = TelegramBadRequest(

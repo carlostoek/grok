@@ -61,9 +61,9 @@ async def test_allowlist_blocks_cfg_callback(monkeypatch):
 
 
 def test_validate_prompt_max_length():
-    err = bot._validate_prompt("x" * (bot.MAX_PROMPT_LEN + 1))
+    err = bot._validate_prompt("x" * (bot.TELEGRAM_MAX_TEXT_LEN + 1))
     assert err is not None
-    assert str(bot.MAX_PROMPT_LEN) in err
+    assert str(bot.TELEGRAM_MAX_TEXT_LEN) in err
 
 
 def test_log_xai_error_does_not_log_body(capsys):

@@ -399,6 +399,10 @@ def _deps() -> dict[str, Any]:
 def _activate_model(deps: dict[str, Any], user_id: int, model_key: str) -> None:
     state = deps["get_user_state"](user_id)
     state["pending_prompt"] = None
+    state["awaiting_long_prompt_text"] = False
+    state["pending_edit_file_ids"] = None
+    state["pending_edit_integrate_mode"] = False
+    state["pending_edit_is_video"] = False
     state["model"] = model_key
     deps["set_model"](user_id, model_key)
 
