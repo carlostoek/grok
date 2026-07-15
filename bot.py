@@ -150,12 +150,13 @@ KIE_DOWNLOAD_HOSTS = frozenset({
 KIE_DOWNLOAD_HOST_SUFFIXES = (".aiquickdraw.com", ".redpandaai.co")
 KIE_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SEC)
 
-# Replicate face swap — longer waits for album batches (default SDK write=30s is too tight).
-REPLICATE_WAIT_SEC = 300
+# Replicate face swap — API allows Prefer: wait=x only between 1 and 60 seconds.
+# Jobs that take longer are completed via the SDK's prediction.wait() polling loop.
+REPLICATE_WAIT_SEC = 60
 REPLICATE_RATE_LIMIT_SEC = 10
 REPLICATE_HTTP_TIMEOUT = httpx.Timeout(
     connect=10.0,
-    read=REPLICATE_WAIT_SEC + 30,
+    read=90.0,
     write=120.0,
     pool=10.0,
 )

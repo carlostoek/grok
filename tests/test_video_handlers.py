@@ -219,6 +219,10 @@ async def test_faceswap_confirm_yes_executes_swap(sessions_file, tmp_path):
     callback.message.reply_media_group.assert_awaited_once()
 
 
+def test_faceswap_replicate_wait_respects_api_limit():
+    assert bot.REPLICATE_WAIT_SEC == 60
+
+
 @pytest.mark.asyncio
 async def test_faceswap_batch_partial_failure_still_delivers(sessions_file, tmp_path):
     uid = 1204
