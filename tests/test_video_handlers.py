@@ -223,6 +223,20 @@ def test_faceswap_replicate_wait_respects_api_limit():
     assert bot.REPLICATE_WAIT_SEC == 60
 
 
+def test_faceswap_progress_bar_shows_visual_fill():
+    bar = bot._faceswap_progress_bar(5, 10)
+    assert "5/10" in bar
+    assert "50%" in bar
+    assert "█" in bar
+    assert "░" in bar
+
+
+def test_faceswap_progress_message_includes_current_step():
+    text = bot._faceswap_progress_message(2, 6, current=3)
+    assert "2/6" in text
+    assert "Imagen 3/6" in text
+
+
 @pytest.mark.asyncio
 async def test_faceswap_batch_partial_failure_still_delivers(sessions_file, tmp_path):
     uid = 1204
@@ -266,6 +280,7 @@ async def test_faceswap_batch_partial_failure_still_delivers(sessions_file, tmp_
     sent_media = callback.message.reply_media_group.await_args.args[0]
     assert len(sent_media) == 2
     final_status = callback.message.edit_text.await_args_list[-1].args[0]
+    assert "[█" in final_status
     assert "2/3" in final_status
     assert "Fallos" in final_status
     assert "imagen 3" in final_status

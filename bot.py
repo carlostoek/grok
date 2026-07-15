@@ -161,6 +161,7 @@ REPLICATE_HTTP_TIMEOUT = httpx.Timeout(
     pool=10.0,
 )
 TELEGRAM_MEDIA_GROUP_MAX = 10
+FACESWAP_PROGRESS_WIDTH = 10
 
 # (GROK_PROVIDERS removed — replaced by the granular GROK_IMAGINE_VARIANTS + unified /config FSM)
 
@@ -1826,11 +1827,64 @@ def _faceswap_replicate_single(
     return result_path
 
 
+def _faceswap_progress_bar(
+    completed: int,
+    total: int,
+    *,
+    width: int = FACESWAP_PROGRESS_WIDTH,
+) -> str:
+    if total <= 0:
+        return f"[{'?' * width}] 0/0 (0%)"
+    completed = max(0, min(completed, total))
+    filled = round(width * completed / total)
+    empty = width - filled
+    pct = completed * 100 // total
+    return f"[{'█' * filled}{'░' * empty}] {completed}/{total} ({pct}%)"
+
+
+def _faceswap_progress_message(
+    completed: int,
+    total: int,
+    *,
+    current: int | None = None,
+) -> str:
+    bar = _faceswap_progress_bar(completed, total)
+    if current is not None and 1 <= current <= total:
+        return f"Face swap\n{bar}\nImagen {current}/{total} en Replicate..."
+    return f"Face swap\n{bar}"
+
+
+def _log_faceswap_progress(
+    user_id: int,
+    completed: int,
+    total: int,
+    *,
+    current: int | None = None,
+    target_name: str | None = None,
+    outcome: str | None = None,
+    detail: str | None = None,
+) -> None:
+    parts = [
+        f"[faceswap] user={user_id}",
+        _faceswap_progress_bar(completed, total),
+    ]
+    if current is not None:
+        parts.append(f"step={current}/{total}")
+    if target_name:
+        parts.append(f"file={target_name}")
+    if outcome:
+        parts.append(f"outcome={outcome}")
+    if detail:
+        parts.append(f"detail={detail}")
+    print(" ".join(parts))
+
+
 def _format_faceswap_batch_status(
     processed: int,
     total: int,
     failures: list[str],
 ) -> str:
+    bar = _faceswap_progress_bar(processed, total)
     if failures:
         summary = f"Completadas {processed}/{total} imagenes."
         if processed == 0:
@@ -1839,10 +1893,10 @@ def _format_faceswap_batch_status(
         detail = "; ".join(shown)
         if len(failures) > 3:
             detail += f"; y {len(failures) - 3} mas"
-        return f"{summary}\nFallos: {detail}"
+        return f"{bar}\n{summary}\nFallos: {detail}"
     if total == 1:
-        return "Procesada 1 imagen."
-    return f"Procesadas {processed}/{total} imagenes."
+        return f"{bar}\nProcesada 1 imagen."
+    return f"{bar}\nProcesadas {processed}/{total} imagenes."
 
 
 async def _send_faceswap_photos(
@@ -1881,7 +1935,7 @@ async def _execute_faceswap_single(
         return
 
     if status_msg is None:
-        status_msg = await anchor_message.answer("Procesando face swap...")
+        status_msg = await anchor_message.answer(_faceswap_progress_message(0, 1, current=1))
 
     temp_input = Path(tempfile.mkdtemp(prefix="fs_single_"))
     temp_output = temp_input / "output"
@@ -1889,6 +1943,7 @@ async def _execute_faceswap_single(
     result_path = None
 
     try:
+        _log_faceswap_progress(user_id, 0, 1, current=1, outcome="start")
         target_path = await download.download_telegram_photo(bot, file_id, temp_input)
         result_path = await asyncio.to_thread(
             _faceswap_replicate_single,
@@ -1897,9 +1952,24 @@ async def _execute_faceswap_single(
             temp_output,
         )
         await _send_faceswap_photos(anchor_message, [result_path])
+        _log_faceswap_progress(
+            user_id,
+            1,
+            1,
+            target_name=target_path.name,
+            outcome="ok",
+        )
         await status_msg.edit_text(_format_faceswap_batch_status(1, 1, []))
     except Exception as e:
-        print(f"[faceswap] single error: {e}")
+        _log_faceswap_progress(
+            user_id,
+            0,
+            1,
+            current=1,
+            target_name=target_path.name if target_path else None,
+            outcome="fail",
+            detail=str(e),
+        )
         await status_msg.edit_text(_format_faceswap_batch_status(0, 1, [str(e)]))
     finally:
         if target_path:
@@ -1926,14 +1996,11 @@ async def _execute_faceswap_batch(
         return
 
     count = len(file_ids)
+    initial_status = _faceswap_progress_message(0, count, current=1 if count else None)
     if status_msg is None:
-        status_msg = await anchor_message.reply(
-            f"Procesando 0/{count} imagen{'es' if count > 1 else ''}..."
-        )
+        status_msg = await anchor_message.reply(initial_status)
     else:
-        await status_msg.edit_text(
-            f"Procesando 0/{count} imagen{'es' if count > 1 else ''}..."
-        )
+        await status_msg.edit_text(initial_status)
 
     temp_root = Path(tempfile.mkdtemp(prefix="fs_album_"))
     temp_output = temp_root / "output"
@@ -1944,8 +2011,9 @@ async def _execute_faceswap_batch(
     try:
         for i, file_id in enumerate(file_ids, 1):
             await status_msg.edit_text(
-                f"Procesando {i}/{count} imagen{'es' if count > 1 else ''}..."
+                _faceswap_progress_message(i - 1, count, current=i)
             )
+            _log_faceswap_progress(user_id, i - 1, count, current=i, outcome="start")
             target_path = None
             try:
                 target_path = await download.download_telegram_photo(
@@ -1959,9 +2027,25 @@ async def _execute_faceswap_batch(
                     temp_output,
                 )
                 result_paths.append(result_path)
+                await status_msg.edit_text(_faceswap_progress_message(i, count))
+                _log_faceswap_progress(
+                    user_id,
+                    i,
+                    count,
+                    target_name=target_path.name,
+                    outcome="ok",
+                )
             except Exception as e:
-                print(f"[faceswap] batch error image {i}/{count}: {e}")
                 failures.append(f"imagen {i}: {e}")
+                _log_faceswap_progress(
+                    user_id,
+                    len(result_paths),
+                    count,
+                    current=i,
+                    target_name=target_path.name if target_path else None,
+                    outcome="fail",
+                    detail=str(e),
+                )
             finally:
                 if i < count:
                     await asyncio.sleep(REPLICATE_RATE_LIMIT_SEC)
@@ -2074,6 +2158,8 @@ async def _handle_integrate_ref_photo(message: types.Message):
 # Replicate face swap batch (sync wrapper for CLI/tests)
 # ---------------------------------------------------------------------------
 def _process_batch_replicate_sync(source_path: str, input_dir: Path, output_dir: Path) -> dict:
+    from tqdm import tqdm
+
     extensions = (".jpg", ".jpeg", ".png", ".webp")
     image_files = []
     for ext in extensions:
@@ -2082,12 +2168,19 @@ def _process_batch_replicate_sync(source_path: str, input_dir: Path, output_dir:
     image_files = sorted(set(image_files))
 
     stats = {"total": len(image_files), "processed": 0, "failed": 0}
-    for index, target_path in enumerate(image_files):
+    for index, target_path in enumerate(tqdm(image_files, desc="Face swap", unit="img")):
         try:
             _faceswap_replicate_single(source_path, target_path, output_dir)
             stats["processed"] += 1
+            print(
+                f"[faceswap] {_faceswap_progress_bar(stats['processed'], stats['total'])} "
+                f"file={target_path.name} outcome=ok"
+            )
         except Exception as e:
-            print(f"Error processing {target_path.name}: {e}")
+            print(
+                f"[faceswap] {_faceswap_progress_bar(stats['processed'], stats['total'])} "
+                f"file={target_path.name} outcome=fail detail={e}"
+            )
             stats["failed"] += 1
         if index < len(image_files) - 1:
             time.sleep(REPLICATE_RATE_LIMIT_SEC)
