@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import aiohttp
+import httpx
 import replicate
 from aiogram import BaseMiddleware, Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -149,11 +150,22 @@ KIE_DOWNLOAD_HOSTS = frozenset({
 KIE_DOWNLOAD_HOST_SUFFIXES = (".aiquickdraw.com", ".redpandaai.co")
 KIE_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SEC)
 
+# Replicate face swap — longer waits for album batches (default SDK write=30s is too tight).
+REPLICATE_WAIT_SEC = 300
+REPLICATE_RATE_LIMIT_SEC = 10
+REPLICATE_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=REPLICATE_WAIT_SEC + 30,
+    write=120.0,
+    pool=10.0,
+)
+TELEGRAM_MEDIA_GROUP_MAX = 10
+
 # (GROK_PROVIDERS removed — replaced by the granular GROK_IMAGINE_VARIANTS + unified /config FSM)
 
 # Per-user in-memory cache (hydrated from sessions.py persistence on first access).
 # Keys: model (top-level), grok_imagine_provider + grok_imagine_variant (granular Imagine config),
-#       source_path, fs_state, pending_prompt,
+#       source_path, fs_state, pending_prompt, pending_faceswap_file_ids,
 #       awaiting_long_prompt_text, pending_edit_file_ids,
 #       pending_edit_integrate_mode, pending_edit_is_video.
 # Model, provider, and model-specific settings are configured via the unified /config FSM
@@ -294,6 +306,17 @@ def _prompt_needs_long_text_collection(prompt: str) -> bool:
     return len(prompt) > TELEGRAM_CAPTION_COLLECT_THRESHOLD
 
 
+def _confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Confirmar", callback_data="confirm:yes"),
+         InlineKeyboardButton(text="Cancelar", callback_data="confirm:no")],
+    ])
+
+
+def _clear_pending_faceswap(state: dict) -> None:
+    state["pending_faceswap_file_ids"] = None
+
+
 def _set_long_prompt_collection(
     state: dict,
     *,
@@ -302,6 +325,7 @@ def _set_long_prompt_collection(
     is_video: bool,
 ) -> None:
     state["pending_prompt"] = None
+    _clear_pending_faceswap(state)
     state["awaiting_long_prompt_text"] = True
     state["pending_edit_file_ids"] = file_ids
     state["pending_edit_integrate_mode"] = integrate_mode
@@ -555,6 +579,7 @@ def get_user_state(user_id: int) -> dict:
             "fs_state": persisted.get("state", sessions.FsState.IDLE),
             "integrate_ref_awaiting": False,
             "pending_prompt": None,
+            "pending_faceswap_file_ids": None,
             "awaiting_long_prompt_text": False,
             "pending_edit_file_ids": None,
             "pending_edit_integrate_mode": False,
@@ -809,15 +834,38 @@ async def handle_confirm_generation(callback: types.CallbackQuery):
 
     if action == "no":
         state["pending_prompt"] = None
+        _clear_pending_faceswap(state)
         await callback.message.edit_text("Generacion cancelada.")
         await callback.answer()
+        return
+
+    file_ids = state.get("pending_faceswap_file_ids")
+    if file_ids:
+        _clear_pending_faceswap(state)
+        state["pending_prompt"] = None
+        await callback.message.edit_text("Procesando face swap...", reply_markup=None)
+        await callback.answer()
+        if len(file_ids) == 1:
+            await _execute_faceswap_single(
+                callback.message,
+                file_ids[0],
+                user_id=callback.from_user.id,
+                status_msg=callback.message,
+            )
+        else:
+            await _execute_faceswap_batch(
+                callback.message,
+                file_ids,
+                user_id=callback.from_user.id,
+                status_msg=callback.message,
+            )
         return
 
     prompt = state.get("pending_prompt")
     state["pending_prompt"] = None
 
     if not prompt:
-        await callback.message.edit_text("El prompt ya no esta disponible. Envia uno nuevo.")
+        await callback.message.edit_text("Ya no hay nada pendiente. Envia una imagen o prompt nuevo.")
         await callback.answer()
         return
 
@@ -1060,16 +1108,13 @@ async def handle_text(message: types.Message):
     model = get_model(message.from_user.id)
 
     if model["key"] in ("grok", "grok_video"):
+        _clear_pending_faceswap(state)
         state["pending_prompt"] = prompt
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Confirmar", callback_data="confirm:yes"),
-             InlineKeyboardButton(text="Cancelar", callback_data="confirm:no")],
-        ])
         media_word = "video" if model["key"] == "grok_video" else "imagen"
         await message.answer(
             f"¿Confirmas generar este {media_word}?\n\n<i>{_escape_prompt(prompt)}</i>",
             parse_mode="HTML",
-            reply_markup=kb,
+            reply_markup=_confirmation_keyboard(),
         )
         return
 
@@ -1706,51 +1751,260 @@ async def _process_album_after_delay(cache_key: tuple, chat_id: int, first_msg: 
         return
 
     file_ids = [msg.photo[-1].file_id for msg in messages if msg.photo]
-    count = len(file_ids)
-    if count == 0:
+    if not file_ids:
         return
 
-    status_msg = await first_msg.reply(
-        f"Procesando {count} imagen{'es' if count > 1 else ''}..."
-    )
-
-    temp_input = Path(tempfile.mkdtemp(prefix="fs_album_"))
-    temp_output = temp_input / "output"
-
-    downloaded = []
-    try:
-        for fid in file_ids:
-            path = await download.download_telegram_photo(bot, fid, temp_input)
-            downloaded.append(path)
-
-        stats = _process_batch_replicate_sync(
-            source_path=str(source_path),
-            input_dir=temp_input,
-            output_dir=temp_output,
-        )
-
-        processed = sorted(temp_output.glob("*"))
-        if processed:
-            media = []
-            for p in processed:
-                media.append(types.InputMediaPhoto(
-                    media=BufferedInputFile(p.read_bytes(), filename=p.name)
-                ))
-            await first_msg.reply_media_group(media)
-
-        await status_msg.edit_text(
-            f"Procesadas {stats['processed']}/{count} imagenes"
-        )
-    except Exception as e:
-        await status_msg.edit_text(f"Error: {e}")
-    finally:
-        download.cleanup_temp_files(downloaded)
-        shutil.rmtree(temp_input, ignore_errors=True)
+    await _request_faceswap_confirmation(first_msg, file_ids)
 
 
 # ---------------------------------------------------------------------------
 # Face swap photo processing (single photo, no album)
 # ---------------------------------------------------------------------------
+async def _request_faceswap_confirmation(message: types.Message, file_ids: list[str]) -> None:
+    state = get_user_state(message.from_user.id)
+    state["pending_prompt"] = None
+    state["pending_faceswap_file_ids"] = file_ids
+    n = len(file_ids)
+    if n == 1:
+        text = "¿Confirmas hacer face swap con esta imagen?"
+    else:
+        text = f"¿Confirmas hacer face swap con estas {n} imágenes?"
+    await message.answer(text, reply_markup=_confirmation_keyboard())
+
+
+_replicate_client: replicate.Client | None = None
+
+
+def _get_replicate_client() -> replicate.Client:
+    global _replicate_client
+    if _replicate_client is None:
+        _replicate_client = replicate.Client(timeout=REPLICATE_HTTP_TIMEOUT)
+    return _replicate_client
+
+
+def _urllib_download_bytes(url: str, *, timeout: int = DOWNLOAD_TIMEOUT_SEC) -> bytes:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _replicate_output_bytes(output) -> bytes:
+    if hasattr(output, "read"):
+        data = output.read()
+        if isinstance(data, bytes):
+            return data
+    if isinstance(output, str):
+        return _urllib_download_bytes(output)
+    if isinstance(output, list) and output:
+        item = output[0]
+        if hasattr(item, "read"):
+            data = item.read()
+            if isinstance(data, bytes):
+                return data
+        url = item.url if hasattr(item, "url") else str(item)
+        return _urllib_download_bytes(url)
+    raise ValueError("Formato de salida de Replicate no reconocido")
+
+
+def _faceswap_replicate_single(
+    source_path: str | Path,
+    target_path: Path,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    client = _get_replicate_client()
+    with open(source_path, "rb") as src_f, open(target_path, "rb") as tgt_f:
+        output = client.run(
+            MODELS["faceswap"]["id"],
+            input={"source_img": src_f, "target_img": tgt_f},
+            wait=REPLICATE_WAIT_SEC,
+        )
+    result_path = output_dir / target_path.name
+    result_path.write_bytes(_replicate_output_bytes(output))
+    return result_path
+
+
+def _format_faceswap_batch_status(
+    processed: int,
+    total: int,
+    failures: list[str],
+) -> str:
+    if failures:
+        summary = f"Completadas {processed}/{total} imagenes."
+        if processed == 0:
+            summary = f"No se pudo procesar ninguna de las {total} imagenes."
+        shown = failures[:3]
+        detail = "; ".join(shown)
+        if len(failures) > 3:
+            detail += f"; y {len(failures) - 3} mas"
+        return f"{summary}\nFallos: {detail}"
+    if total == 1:
+        return "Procesada 1 imagen."
+    return f"Procesadas {processed}/{total} imagenes."
+
+
+async def _send_faceswap_photos(
+    anchor_message: types.Message,
+    result_paths: list[Path],
+) -> None:
+    if not result_paths:
+        return
+    for offset in range(0, len(result_paths), TELEGRAM_MEDIA_GROUP_MAX):
+        chunk = result_paths[offset:offset + TELEGRAM_MEDIA_GROUP_MAX]
+        media = [
+            types.InputMediaPhoto(
+                media=BufferedInputFile(path.read_bytes(), filename=path.name)
+            )
+            for path in chunk
+        ]
+        await anchor_message.reply_media_group(media)
+
+
+async def _execute_faceswap_single(
+    anchor_message: types.Message,
+    file_id: str,
+    *,
+    user_id: int,
+    status_msg: types.Message | None = None,
+) -> None:
+    state = get_user_state(user_id)
+    source_path = Path(state["source_path"])
+    if not source_path.exists():
+        text = "Source no encontrado. Usa /cambiar_source para configurar de nuevo."
+        if status_msg:
+            await status_msg.edit_text(text)
+        else:
+            await anchor_message.answer(text)
+        state["source_path"] = None
+        return
+
+    if status_msg is None:
+        status_msg = await anchor_message.answer("Procesando face swap...")
+
+    temp_input = Path(tempfile.mkdtemp(prefix="fs_single_"))
+    temp_output = temp_input / "output"
+    target_path = None
+    result_path = None
+
+    try:
+        target_path = await download.download_telegram_photo(bot, file_id, temp_input)
+        result_path = await asyncio.to_thread(
+            _faceswap_replicate_single,
+            source_path,
+            target_path,
+            temp_output,
+        )
+        await _send_faceswap_photos(anchor_message, [result_path])
+        await status_msg.edit_text(_format_faceswap_batch_status(1, 1, []))
+    except Exception as e:
+        print(f"[faceswap] single error: {e}")
+        await status_msg.edit_text(_format_faceswap_batch_status(0, 1, [str(e)]))
+    finally:
+        if target_path:
+            download.cleanup_temp_files([target_path])
+        shutil.rmtree(temp_input, ignore_errors=True)
+
+
+async def _execute_faceswap_batch(
+    anchor_message: types.Message,
+    file_ids: list[str],
+    *,
+    user_id: int,
+    status_msg: types.Message | None = None,
+) -> None:
+    state = get_user_state(user_id)
+    source_path = Path(state["source_path"])
+    if not source_path.exists():
+        text = "Source no encontrado. Usa /cambiar_source."
+        if status_msg:
+            await status_msg.edit_text(text)
+        else:
+            await anchor_message.answer(text)
+        state["source_path"] = None
+        return
+
+    count = len(file_ids)
+    if status_msg is None:
+        status_msg = await anchor_message.reply(
+            f"Procesando 0/{count} imagen{'es' if count > 1 else ''}..."
+        )
+    else:
+        await status_msg.edit_text(
+            f"Procesando 0/{count} imagen{'es' if count > 1 else ''}..."
+        )
+
+    temp_root = Path(tempfile.mkdtemp(prefix="fs_album_"))
+    temp_output = temp_root / "output"
+    downloaded: list[Path] = []
+    result_paths: list[Path] = []
+    failures: list[str] = []
+
+    try:
+        for i, file_id in enumerate(file_ids, 1):
+            await status_msg.edit_text(
+                f"Procesando {i}/{count} imagen{'es' if count > 1 else ''}..."
+            )
+            target_path = None
+            try:
+                target_path = await download.download_telegram_photo(
+                    bot, file_id, temp_root / "input"
+                )
+                downloaded.append(target_path)
+                result_path = await asyncio.to_thread(
+                    _faceswap_replicate_single,
+                    source_path,
+                    target_path,
+                    temp_output,
+                )
+                result_paths.append(result_path)
+            except Exception as e:
+                print(f"[faceswap] batch error image {i}/{count}: {e}")
+                failures.append(f"imagen {i}: {e}")
+            finally:
+                if i < count:
+                    await asyncio.sleep(REPLICATE_RATE_LIMIT_SEC)
+
+        send_error = None
+        if result_paths:
+            try:
+                await _send_faceswap_photos(anchor_message, result_paths)
+            except Exception as e:
+                send_error = str(e)
+                print(f"[faceswap] media group error: {e}")
+                for result_path in result_paths:
+                    try:
+                        photo = BufferedInputFile(
+                            result_path.read_bytes(),
+                            filename=result_path.name,
+                        )
+                        await anchor_message.reply_photo(photo)
+                    except Exception as photo_exc:
+                        print(f"[faceswap] fallback photo error: {photo_exc}")
+                        if send_error is None:
+                            send_error = str(photo_exc)
+
+        if send_error:
+            failures.append(f"envio a Telegram: {send_error}")
+
+        await status_msg.edit_text(
+            _format_faceswap_batch_status(len(result_paths), count, failures)
+        )
+    except Exception as e:
+        print(f"[faceswap] batch unexpected error: {e}")
+        if result_paths:
+            try:
+                await _send_faceswap_photos(anchor_message, result_paths)
+            except Exception as send_exc:
+                print(f"[faceswap] rescue send error: {send_exc}")
+        await status_msg.edit_text(
+            _format_faceswap_batch_status(len(result_paths), count, failures or [str(e)])
+        )
+    finally:
+        download.cleanup_temp_files(downloaded)
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 async def _handle_faceswap_photo(message: types.Message):
     state = get_user_state(message.from_user.id)
 
@@ -1774,37 +2028,7 @@ async def _handle_faceswap_photo(message: types.Message):
         state["source_path"] = None
         return
 
-    status_msg = await message.answer("Procesando face swap...")
-
-    temp_input = Path(tempfile.mkdtemp(prefix="fs_single_"))
-    temp_output = temp_input / "output"
-    target_path = None
-
-    try:
-        file_id = message.photo[-1].file_id
-        target_path = await download.download_telegram_photo(bot, file_id, temp_input)
-
-        stats = _process_batch_replicate_sync(
-            source_path=str(source_path),
-            input_dir=temp_input,
-            output_dir=temp_output,
-        )
-
-        processed = list(temp_output.glob("*"))
-        if processed:
-            with open(processed[0], "rb") as f:
-                photo = BufferedInputFile(f.read(), filename="swap.jpg")
-                await message.reply_photo(photo)
-        else:
-            await message.answer("No se pudo procesar la imagen.")
-
-        await status_msg.edit_text(f"Procesada {stats['processed']} imagen")
-    except Exception as e:
-        await status_msg.edit_text(f"Error: {e}")
-    finally:
-        if target_path:
-            download.cleanup_temp_files([target_path])
-        shutil.rmtree(temp_input, ignore_errors=True)
+    await _request_faceswap_confirmation(message, [message.photo[-1].file_id])
 
 
 async def _handle_faceswap_source_photo(message: types.Message):
@@ -1846,7 +2070,7 @@ async def _handle_integrate_ref_photo(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
-# Replicate face swap batch (sync wrapper around replicate.run)
+# Replicate face swap batch (sync wrapper for CLI/tests)
 # ---------------------------------------------------------------------------
 def _process_batch_replicate_sync(source_path: str, input_dir: Path, output_dir: Path) -> dict:
     extensions = (".jpg", ".jpeg", ".png", ".webp")
@@ -1856,39 +2080,16 @@ def _process_batch_replicate_sync(source_path: str, input_dir: Path, output_dir:
         image_files.extend(list(input_dir.glob(f"*{ext.upper()}")))
     image_files = sorted(set(image_files))
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     stats = {"total": len(image_files), "processed": 0, "failed": 0}
-
-    # Encode source as base64 data URI once
-    with open(source_path, "rb") as f:
-        source_b64 = base64.b64encode(f.read()).decode()
-    source_uri = f"data:image/jpeg;base64,{source_b64}"
-
-    for target_path in image_files:
+    for index, target_path in enumerate(image_files):
         try:
-            with open(target_path, "rb") as f:
-                target_b64 = base64.b64encode(f.read()).decode()
-            target_uri = f"data:image/jpeg;base64,{target_b64}"
-
-            output = replicate.run(
-                MODELS["faceswap"]["id"],
-                input={"source_img": source_uri, "target_img": target_uri},
-            )
-
-            result_path = output_dir / target_path.name
-            if isinstance(output, str):
-                import urllib.request
-                result_path.write_bytes(urllib.request.urlopen(output).read())
-            elif hasattr(output, "read"):
-                result_path.write_bytes(output.read())
-            elif isinstance(output, list) and len(output) > 0:
-                url = output[0].url if hasattr(output[0], "url") else str(output[0])
-                import urllib.request
-                result_path.write_bytes(urllib.request.urlopen(url).read())
+            _faceswap_replicate_single(source_path, target_path, output_dir)
             stats["processed"] += 1
         except Exception as e:
             print(f"Error processing {target_path.name}: {e}")
             stats["failed"] += 1
+        if index < len(image_files) - 1:
+            time.sleep(REPLICATE_RATE_LIMIT_SEC)
 
     return stats
 
@@ -2728,6 +2929,7 @@ import config_flow
 _CONFIG_DEPS = {
         "MODELS": MODELS,
         "get_user_state": get_user_state,
+        "clear_pending_faceswap": _clear_pending_faceswap,
         "get_grok_imagine_config": get_grok_imagine_config,
         "set_model": sessions.set_model,
         "set_grok_imagine_config": sessions.set_grok_imagine_config,

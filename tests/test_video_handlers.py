@@ -160,6 +160,130 @@ async def test_imagine_config_guard_before_mutation(sessions_file):
 
 
 @pytest.mark.asyncio
+async def test_faceswap_photo_shows_confirmation(sessions_file, tmp_path):
+    uid = 1201
+    bot.get_user_state(uid)["model"] = "faceswap"
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"source-bytes")
+    bot.get_user_state(uid)["source_path"] = str(source)
+
+    msg = _make_user_message(user_id=uid, photo=[MagicMock(file_id="p-fs")])
+    with patch.object(bot, "_process_batch_replicate_sync") as mock_batch:
+        await bot.handle_photo_no_caption(msg)
+
+    mock_batch.assert_not_called()
+    msg.answer.assert_awaited_once()
+    assert "Confirmas hacer face swap" in msg.answer.await_args.args[0]
+    assert bot.get_user_state(uid)["pending_faceswap_file_ids"] == ["p-fs"]
+
+
+@pytest.mark.asyncio
+async def test_faceswap_confirm_yes_executes_swap(sessions_file, tmp_path):
+    uid = 1202
+    bot.get_user_state(uid)["model"] = "faceswap"
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"source-bytes")
+    bot.get_user_state(uid)["source_path"] = str(source)
+    bot.get_user_state(uid)["pending_faceswap_file_ids"] = ["p-confirm"]
+
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "confirm:yes"
+    callback.message = MagicMock()
+    callback.message.edit_text = AsyncMock()
+    callback.message.reply_media_group = AsyncMock()
+    callback.answer = AsyncMock()
+
+    target = tmp_path / "target.jpg"
+    target.write_bytes(b"target-bytes")
+    output = tmp_path / "swap.jpg"
+    output.write_bytes(b"out")
+
+    with patch.object(
+        bot,
+        "_faceswap_replicate_single",
+        return_value=output,
+    ) as mock_swap:
+        with patch(
+            "bot.download.download_telegram_photo",
+            new_callable=AsyncMock,
+            return_value=target,
+        ):
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await bot.handle_confirm_generation(callback)
+
+    mock_swap.assert_called_once()
+    assert bot.get_user_state(uid)["pending_faceswap_file_ids"] is None
+    edit_calls = [call.args[0] for call in callback.message.edit_text.await_args_list]
+    assert any("Procesando face swap" in text for text in edit_calls)
+    callback.message.reply_media_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_faceswap_batch_partial_failure_still_delivers(sessions_file, tmp_path):
+    uid = 1204
+    bot.get_user_state(uid)["model"] = "faceswap"
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"source-bytes")
+    bot.get_user_state(uid)["source_path"] = str(source)
+    bot.get_user_state(uid)["pending_faceswap_file_ids"] = ["p1", "p2", "p3"]
+
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "confirm:yes"
+    callback.message = MagicMock()
+    callback.message.edit_text = AsyncMock()
+    callback.message.reply_media_group = AsyncMock()
+    callback.answer = AsyncMock()
+
+    outputs = []
+
+    def _fake_swap(source_path, target_path, output_dir):
+        if target_path.name.endswith("3.jpg"):
+            raise TimeoutError("replicate timeout")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result = output_dir / target_path.name
+        result.write_bytes(b"swap-bytes")
+        outputs.append(result)
+        return result
+
+    async def _fake_download(_bot, file_id, temp_dir):
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        path = temp_dir / f"{file_id}.jpg"
+        path.write_bytes(b"target")
+        return path
+
+    with patch.object(bot, "_faceswap_replicate_single", side_effect=_fake_swap):
+        with patch("bot.download.download_telegram_photo", side_effect=_fake_download):
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await bot.handle_confirm_generation(callback)
+
+    callback.message.reply_media_group.assert_awaited_once()
+    sent_media = callback.message.reply_media_group.await_args.args[0]
+    assert len(sent_media) == 2
+    final_status = callback.message.edit_text.await_args_list[-1].args[0]
+    assert "2/3" in final_status
+    assert "Fallos" in final_status
+    assert "imagen 3" in final_status
+
+
+@pytest.mark.asyncio
+async def test_faceswap_confirm_no_clears_pending(sessions_file):
+    callback = MagicMock()
+    callback.from_user.id = 1203
+    callback.data = "confirm:no"
+    callback.message = MagicMock()
+    callback.message.edit_text = AsyncMock()
+    callback.answer = AsyncMock()
+    bot.get_user_state(1203)["pending_faceswap_file_ids"] = ["p1", "p2"]
+
+    await bot.handle_confirm_generation(callback)
+
+    assert bot.get_user_state(1203)["pending_faceswap_file_ids"] is None
+    callback.message.edit_text.assert_awaited_once_with("Generacion cancelada.")
+
+
+@pytest.mark.asyncio
 async def test_confirm_cancel_clears_pending_prompt():
     callback = MagicMock()
     callback.from_user.id = 1002
@@ -190,7 +314,7 @@ async def test_confirm_stale_prompt_shows_error():
     await bot.handle_confirm_generation(callback)
 
     callback.message.edit_text.assert_awaited_once_with(
-        "El prompt ya no esta disponible. Envia uno nuevo."
+        "Ya no hay nada pendiente. Envia una imagen o prompt nuevo."
     )
     callback.answer.assert_awaited_once()
 
@@ -207,6 +331,7 @@ async def test_model_switch_clears_pending_prompt(sessions_file):
     user_state = bot.get_user_state(2002)
     user_state["model"] = "grok_video"
     user_state["pending_prompt"] = "stale prompt"
+    user_state["pending_faceswap_file_ids"] = ["p-stale"]
     bot._set_long_prompt_collection(
         user_state,
         file_ids=["p1"],
@@ -224,6 +349,7 @@ async def test_model_switch_clears_pending_prompt(sessions_file):
     await bot.handle_cfg_model(callback, fsm_state)
 
     assert user_state["pending_prompt"] is None
+    assert user_state["pending_faceswap_file_ids"] is None
     assert user_state["awaiting_long_prompt_text"] is False
     assert user_state["pending_edit_file_ids"] is None
     assert user_state["pending_edit_integrate_mode"] is False
