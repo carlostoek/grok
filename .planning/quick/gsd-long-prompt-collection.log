@@ -1,0 +1,10 @@
+[2026-06-24] gsd-executor: starting long-prompt-collection implementation
+[2026-06-24] Phase 1: constants, _validate_prompt, _format_result_caption, result handlers — DONE
+[2026-06-24] Phase 2: state keys + collection helpers — DONE
+[2026-06-24] Phase 3: triggers in handle_photo_caption + _process_grok_album_after_delay — DONE
+[2026-06-24] Phase 4: _process_single_photo_edit, _complete_long_prompt_collection, handle_text — DONE
+[2026-06-24] Phase 5: config_flow._activate_model cleanup — DONE
+[2026-06-24] Phase 6: tests — DONE
+[2026-06-24] pytest tests/test_long_prompt_collection.py -v: 15 passed
+[2026-06-24] pytest tests/ -q: 255 passed, 2 skipped
+[2026-06-24] self-check PASSED

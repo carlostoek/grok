@@ -1,13 +1,16 @@
 {
   "6181290784": {
     "source_path": "/home/ubuntu/repos/grok/sources/6181290784.jpg",
+    "integrate_ref_path": "/home/ubuntu/repos/grok/integrate_refs/6181290784.jpg",
     "state": "IDLE",
-    "model": "grok",
+    "model": "faceswap",
     "grok_imagine_provider": "kie",
     "grok_imagine_variant": "standard",
     "video_duration": 5,
     "video_aspect_ratio": "9:16",
     "video_resolution": "480p",
+    "video_model": "grok-imagine-video",
+    "video_mode": "spicy",
     "video_hourly_timestamps": [
       1781839949.3381195,
       1781840180.38564,
@@ -19,10 +22,7 @@
       1781842712.4303086,
       1781842752.5656965,
       1781843079.275552
-    ],
-    "video_model": "grok-imagine-video-1.5",
-    "video_mode": "spicy",
-    "integrate_ref_path": "/home/ubuntu/repos/grok/integrate_refs/6181290784.jpg"
+    ]
   },
   "1280444712": {
     "source_path": "/home/ubuntu/repos/grok/sources/1280444712.jpg",
