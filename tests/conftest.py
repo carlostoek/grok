@@ -44,8 +44,11 @@ def make_fsm_context(*, fsm_state: str | None = None, **data):
 @pytest.fixture(autouse=True)
 def reset_runtime_state():
     bot.user_state.clear()
+    bot._active_jobs.clear()
     deps_snapshot = dict(bot._CONFIG_DEPS)
     yield
+    bot.user_state.clear()
+    bot._active_jobs.clear()
     bot._CONFIG_DEPS.clear()
     bot._CONFIG_DEPS.update(deps_snapshot)
 

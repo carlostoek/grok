@@ -315,6 +315,50 @@ def _confirmation_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+# In-flight cancellable jobs (per user). Cooperative cancel: checked between
+# batch items / after long awaits. One active job per user.
+_active_jobs: dict[int, dict] = {}
+
+
+def _cancel_job_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Cancelar", callback_data="cancel_job")],
+        ]
+    )
+
+
+def _start_job(user_id: int, kind: str) -> asyncio.Event:
+    """Register a cancellable job. Cancels any previous job for this user."""
+    prev = _active_jobs.get(user_id)
+    if prev is not None:
+        prev["event"].set()
+    event = asyncio.Event()
+    _active_jobs[user_id] = {"event": event, "kind": kind}
+    return event
+
+
+def _job_cancelled(event: asyncio.Event) -> bool:
+    return event.is_set()
+
+
+def _request_cancel_job(user_id: int) -> bool:
+    job = _active_jobs.get(user_id)
+    if job is None:
+        return False
+    job["event"].set()
+    return True
+
+
+def _finish_job(user_id: int, event: asyncio.Event) -> None:
+    job = _active_jobs.get(user_id)
+    if job is None:
+        return
+    # Only clear if this is still the active registration (not superseded).
+    if job["event"] is event:
+        _active_jobs.pop(user_id, None)
+
+
 def _clear_pending_faceswap(state: dict) -> None:
     state["pending_faceswap_file_ids"] = None
 
@@ -486,12 +530,13 @@ async def _download_telegram_file_id(file_id: str) -> BytesIO:
     return image_data
 
 
-def _image_regenerate_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Regenerar", callback_data="regen")],
-        ]
-    )
+def _image_regenerate_keyboard(*, show_cancel: bool = False) -> InlineKeyboardMarkup:
+    """Keyboard under generated images. show_cancel=True while a job is running
+    (e.g. regeneration in progress on a status message)."""
+    row = [InlineKeyboardButton(text="Regenerar", callback_data="regen")]
+    if show_cancel:
+        row.append(InlineKeyboardButton(text="Cancelar", callback_data="cancel_job"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def _grok_model_for_config(user_id: int, provider: str, variant: str) -> dict:
@@ -829,6 +874,24 @@ def _video_config_summary(user_id: int) -> str:
     return summary
 
 
+@dp.callback_query(lambda c: c.data == "cancel_job")
+async def handle_cancel_job(callback: types.CallbackQuery):
+    """Cancel an in-flight faceswap / image-edit / regenerate job."""
+    if _request_cancel_job(callback.from_user.id):
+        await callback.answer("Cancelando…")
+        # Running loop will update final status; soft-signal on the message.
+        if callback.message is not None:
+            try:
+                current = callback.message.text or callback.message.caption or ""
+                hint = "⏹ Cancelando…"
+                text = f"{current}\n\n{hint}" if current and hint not in current else (current or hint)
+                await safe_edit_text(callback.message, text, reply_markup=None)
+            except Exception:
+                pass
+        return
+    await callback.answer("No hay proceso en curso.", show_alert=True)
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("confirm:"))
 async def handle_confirm_generation(callback: types.CallbackQuery):
     action = callback.data.split(":", 1)[1]
@@ -923,7 +986,12 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
     mode = regen.get("mode", "text")
     await callback.answer("Regenerando...")
 
-    status_msg = await callback.message.answer(f"Regenerando imagen con {model['name']}...")
+    uid = callback.from_user.id
+    cancel_event = _start_job(uid, "regen")
+    status_msg = await callback.message.answer(
+        f"Regenerando imagen con {model['name']}...",
+        reply_markup=_cancel_job_keyboard(),
+    )
     image_data = None
     reference_image = None
     kie_source_ref = regen.get("kie_source_ref")
@@ -936,17 +1004,27 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
                 if source_file_id:
                     image_data = await _download_telegram_file_id(source_file_id)
                 else:
-                    await status_msg.edit_text("No se pudo recuperar la imagen original para regenerar.")
+                    await status_msg.edit_text(
+                        "No se pudo recuperar la imagen original para regenerar.",
+                        reply_markup=None,
+                    )
                     return
                 reference_image, ref_err = _load_integrate_ref_bytes(regen["user_id"])
                 if ref_err:
-                    await status_msg.edit_text(ref_err)
+                    await status_msg.edit_text(ref_err, reply_markup=None)
                     return
             elif source_file_id:
                 image_data = await _download_telegram_file_id(source_file_id)
             else:
-                await status_msg.edit_text("No se pudo recuperar la imagen original para regenerar.")
+                await status_msg.edit_text(
+                    "No se pudo recuperar la imagen original para regenerar.",
+                    reply_markup=None,
+                )
                 return
+
+        if _job_cancelled(cancel_event):
+            await status_msg.edit_text("⏹ Regeneración cancelada.", reply_markup=None)
+            return
 
         output, err, kie_meta = await generate_image(
             model,
@@ -955,8 +1033,11 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
             reference_image=reference_image,
             kie_source_ref=kie_source_ref,
         )
+        if _job_cancelled(cancel_event):
+            await status_msg.edit_text("⏹ Regeneración cancelada.", reply_markup=None)
+            return
         if err:
-            await status_msg.edit_text(err)
+            await status_msg.edit_text(err, reply_markup=None)
             return
 
         prefix = "Edit" if mode == "edit" else "Prompt"
@@ -972,9 +1053,11 @@ async def handle_regenerate_image(callback: types.CallbackQuery):
         )
     except replicate.exceptions.ReplicateError as e:
         backend = _prov_label(model.get("provider", "?"))
-        await status_msg.edit_text(f"Error de {backend}: {e}")
+        await status_msg.edit_text(f"Error de {backend}: {e}", reply_markup=None)
     except Exception as e:
-        await status_msg.edit_text(f"Error inesperado: {e}")
+        await status_msg.edit_text(f"Error inesperado: {e}", reply_markup=None)
+    finally:
+        _finish_job(uid, cancel_event)
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1320,7 @@ async def _process_single_photo_edit(
     uid = user_id if user_id is not None else message.from_user.id
     model = get_model(uid)
     status_msg = None
+    cancel_event: asyncio.Event | None = None
 
     try:
         image_data = await _download_telegram_file_id(file_id)
@@ -1251,20 +1335,30 @@ async def _process_single_photo_edit(
                 await message.answer(prereq_err, parse_mode="HTML")
                 return False
 
+        cancel_event = _start_job(uid, "edit")
         status_label = (
             "Editando imagen (referencia+foto)..."
             if integrate_mode
             else f"Editando imagen con {model['name']}..."
         )
-        status_msg = await message.answer(status_label)
+        status_msg = await message.answer(
+            status_label,
+            reply_markup=_cancel_job_keyboard(),
+        )
+        if _job_cancelled(cancel_event):
+            await status_msg.edit_text("⏹ Edición cancelada.", reply_markup=None)
+            return True
         output, err, kie_meta = await generate_image(
             model,
             prompt,
             image_data,
             reference_image=reference_image,
         )
+        if _job_cancelled(cancel_event):
+            await status_msg.edit_text("⏹ Edición cancelada.", reply_markup=None)
+            return True
         if err:
-            await status_msg.edit_text(err)
+            await status_msg.edit_text(err, reply_markup=None)
             return False
         await process_image_result(
             output,
@@ -1287,16 +1381,19 @@ async def _process_single_photo_edit(
     except replicate.exceptions.ReplicateError as e:
         backend = _prov_label(model.get("provider", "?"))
         if status_msg:
-            await status_msg.edit_text(f"Error de {backend}: {e}")
+            await status_msg.edit_text(f"Error de {backend}: {e}", reply_markup=None)
         else:
             await message.answer(f"Error de {backend}: {e}")
         return False
     except Exception as e:
         if status_msg:
-            await status_msg.edit_text(f"Error inesperado: {e}")
+            await status_msg.edit_text(f"Error inesperado: {e}", reply_markup=None)
         else:
             await message.answer(f"Error inesperado: {e}")
         return False
+    finally:
+        if cancel_event is not None:
+            _finish_job(uid, cancel_event)
 
 
 async def _process_album_edit_from_file_ids(
@@ -1313,42 +1410,69 @@ async def _process_album_edit_from_file_ids(
     backend = _prov_label(model.get("provider", "?"))
     status_msg = None
     reference_image = None
+    cancel_event = _start_job(uid, "album_edit")
+    completed = 0
 
     if integrate_mode:
         reference_image, prereq_err = _validate_integrate_prerequisites(model, uid)
         if prereq_err:
+            _finish_job(uid, cancel_event)
             await anchor_message.answer(prereq_err, parse_mode="HTML")
             return False
 
     try:
         if integrate_mode:
             status_msg = await anchor_message.reply(
-                f"Integrando referencia 0/{n} imágenes ({backend})..."
+                f"Integrando referencia 0/{n} imágenes ({backend})...",
+                reply_markup=_cancel_job_keyboard(),
             )
         else:
             status_msg = await anchor_message.reply(
-                f"Editando 0/{n} imágenes con {model['name']} ({backend})..."
+                f"Editando 0/{n} imágenes con {model['name']} ({backend})...",
+                reply_markup=_cancel_job_keyboard(),
             )
 
         for i, file_id in enumerate(file_ids, 1):
+            if _job_cancelled(cancel_event):
+                await status_msg.edit_text(
+                    f"⏹ Cancelado. Completadas {completed}/{n} imágenes.",
+                    reply_markup=None,
+                )
+                return True
+
             if integrate_mode:
                 await status_msg.edit_text(
-                    f"Integrando referencia {i}/{n} imágenes ({backend})..."
+                    f"Integrando referencia {i}/{n} imágenes ({backend})...",
+                    reply_markup=_cancel_job_keyboard(),
                 )
             else:
                 await status_msg.edit_text(
-                    f"Editando {i}/{n} imágenes con {model['name']} ({backend})..."
+                    f"Editando {i}/{n} imágenes con {model['name']} ({backend})...",
+                    reply_markup=_cancel_job_keyboard(),
                 )
             image_data = await _download_telegram_file_id(file_id)
+            if _job_cancelled(cancel_event):
+                await status_msg.edit_text(
+                    f"⏹ Cancelado. Completadas {completed}/{n} imágenes.",
+                    reply_markup=None,
+                )
+                return True
             output, err, kie_meta = await generate_image(
                 model,
                 prompt,
                 image_data,
                 reference_image=reference_image,
             )
+            if _job_cancelled(cancel_event):
+                await status_msg.edit_text(
+                    f"⏹ Cancelado. Completadas {completed}/{n} imágenes.",
+                    reply_markup=None,
+                )
+                return True
             if err:
                 await status_msg.edit_text(
-                    f"{i - 1}/{n} completadas; error en imagen {i}: {err}"
+                    f"{completed}/{n} completadas; error en imagen {i}: {err}",
+                    reply_markup=None,
                 )
                 return False
             await process_image_result(
@@ -1369,22 +1493,28 @@ async def _process_album_edit_from_file_ids(
                     integrate_mode=integrate_mode,
                 ),
             )
+            completed += 1
         else:
-            await status_msg.edit_text(f"Completadas {n}/{n} imágenes.")
+            await status_msg.edit_text(
+                f"Completadas {n}/{n} imágenes.",
+                reply_markup=None,
+            )
         return True
 
     except replicate.exceptions.ReplicateError as e:
         if status_msg:
-            await status_msg.edit_text(f"Error de {backend}: {e}")
+            await status_msg.edit_text(f"Error de {backend}: {e}", reply_markup=None)
         else:
             await anchor_message.answer(f"Error de {backend}: {e}")
         return False
     except Exception as e:
         if status_msg:
-            await status_msg.edit_text(f"Error inesperado: {e}")
+            await status_msg.edit_text(f"Error inesperado: {e}", reply_markup=None)
         else:
             await anchor_message.answer(f"Error inesperado: {e}")
         return False
+    finally:
+        _finish_job(uid, cancel_event)
 
 
 async def _complete_long_prompt_collection(message: types.Message, prompt: str) -> bool:
@@ -1883,8 +2013,19 @@ def _format_faceswap_batch_status(
     processed: int,
     total: int,
     failures: list[str],
+    *,
+    cancelled: bool = False,
 ) -> str:
     bar = _faceswap_progress_bar(processed, total)
+    if cancelled:
+        summary = f"⏹ Cancelado. Completadas {processed}/{total} imagenes."
+        if failures:
+            shown = failures[:3]
+            detail = "; ".join(shown)
+            if len(failures) > 3:
+                detail += f"; y {len(failures) - 3} mas"
+            return f"{bar}\n{summary}\nFallos: {detail}"
+        return f"{bar}\n{summary}"
     if failures:
         summary = f"Completadas {processed}/{total} imagenes."
         if processed == 0:
@@ -1928,14 +2069,25 @@ async def _execute_faceswap_single(
     if not source_path.exists():
         text = "Source no encontrado. Usa /cambiar_source para configurar de nuevo."
         if status_msg:
-            await status_msg.edit_text(text)
+            await safe_edit_text(status_msg, text, reply_markup=None)
         else:
             await anchor_message.answer(text)
         state["source_path"] = None
         return
 
+    cancel_event = _start_job(user_id, "faceswap")
+    progress_text = _faceswap_progress_message(0, 1, current=1)
     if status_msg is None:
-        status_msg = await anchor_message.answer(_faceswap_progress_message(0, 1, current=1))
+        status_msg = await anchor_message.answer(
+            progress_text,
+            reply_markup=_cancel_job_keyboard(),
+        )
+    else:
+        await safe_edit_text(
+            status_msg,
+            progress_text,
+            reply_markup=_cancel_job_keyboard(),
+        )
 
     temp_input = Path(tempfile.mkdtemp(prefix="fs_single_"))
     temp_output = temp_input / "output"
@@ -1943,14 +2095,36 @@ async def _execute_faceswap_single(
     result_path = None
 
     try:
+        if _job_cancelled(cancel_event):
+            await safe_edit_text(
+                status_msg,
+                _format_faceswap_batch_status(0, 1, [], cancelled=True),
+                reply_markup=None,
+            )
+            return
+
         _log_faceswap_progress(user_id, 0, 1, current=1, outcome="start")
         target_path = await download.download_telegram_photo(bot, file_id, temp_input)
+        if _job_cancelled(cancel_event):
+            await safe_edit_text(
+                status_msg,
+                _format_faceswap_batch_status(0, 1, [], cancelled=True),
+                reply_markup=None,
+            )
+            return
         result_path = await asyncio.to_thread(
             _faceswap_replicate_single,
             source_path,
             target_path,
             temp_output,
         )
+        if _job_cancelled(cancel_event):
+            await safe_edit_text(
+                status_msg,
+                _format_faceswap_batch_status(0, 1, [], cancelled=True),
+                reply_markup=None,
+            )
+            return
         await _send_faceswap_photos(anchor_message, [result_path])
         _log_faceswap_progress(
             user_id,
@@ -1959,7 +2133,11 @@ async def _execute_faceswap_single(
             target_name=target_path.name,
             outcome="ok",
         )
-        await status_msg.edit_text(_format_faceswap_batch_status(1, 1, []))
+        await safe_edit_text(
+            status_msg,
+            _format_faceswap_batch_status(1, 1, []),
+            reply_markup=None,
+        )
     except Exception as e:
         _log_faceswap_progress(
             user_id,
@@ -1970,8 +2148,13 @@ async def _execute_faceswap_single(
             outcome="fail",
             detail=str(e),
         )
-        await status_msg.edit_text(_format_faceswap_batch_status(0, 1, [str(e)]))
+        await safe_edit_text(
+            status_msg,
+            _format_faceswap_batch_status(0, 1, [str(e)]),
+            reply_markup=None,
+        )
     finally:
+        _finish_job(user_id, cancel_event)
         if target_path:
             download.cleanup_temp_files([target_path])
         shutil.rmtree(temp_input, ignore_errors=True)
@@ -1989,29 +2172,51 @@ async def _execute_faceswap_batch(
     if not source_path.exists():
         text = "Source no encontrado. Usa /cambiar_source."
         if status_msg:
-            await status_msg.edit_text(text)
+            await safe_edit_text(status_msg, text, reply_markup=None)
         else:
             await anchor_message.answer(text)
         state["source_path"] = None
         return
 
     count = len(file_ids)
+    cancel_event = _start_job(user_id, "faceswap")
     initial_status = _faceswap_progress_message(0, count, current=1 if count else None)
     if status_msg is None:
-        status_msg = await anchor_message.reply(initial_status)
+        status_msg = await anchor_message.reply(
+            initial_status,
+            reply_markup=_cancel_job_keyboard(),
+        )
     else:
-        await status_msg.edit_text(initial_status)
+        await safe_edit_text(
+            status_msg,
+            initial_status,
+            reply_markup=_cancel_job_keyboard(),
+        )
 
     temp_root = Path(tempfile.mkdtemp(prefix="fs_album_"))
     temp_output = temp_root / "output"
     downloaded: list[Path] = []
     result_paths: list[Path] = []
     failures: list[str] = []
+    cancelled = False
 
     try:
         for i, file_id in enumerate(file_ids, 1):
-            await status_msg.edit_text(
-                _faceswap_progress_message(i - 1, count, current=i)
+            if _job_cancelled(cancel_event):
+                cancelled = True
+                _log_faceswap_progress(
+                    user_id,
+                    len(result_paths),
+                    count,
+                    current=i,
+                    outcome="cancelled",
+                )
+                break
+
+            await safe_edit_text(
+                status_msg,
+                _faceswap_progress_message(i - 1, count, current=i),
+                reply_markup=_cancel_job_keyboard(),
             )
             _log_faceswap_progress(user_id, i - 1, count, current=i, outcome="start")
             target_path = None
@@ -2020,14 +2225,25 @@ async def _execute_faceswap_batch(
                     bot, file_id, temp_root / "input"
                 )
                 downloaded.append(target_path)
+                if _job_cancelled(cancel_event):
+                    cancelled = True
+                    break
                 result_path = await asyncio.to_thread(
                     _faceswap_replicate_single,
                     source_path,
                     target_path,
                     temp_output,
                 )
+                if _job_cancelled(cancel_event):
+                    # Drop this result if cancelled during the API wait.
+                    cancelled = True
+                    break
                 result_paths.append(result_path)
-                await status_msg.edit_text(_faceswap_progress_message(i, count))
+                await safe_edit_text(
+                    status_msg,
+                    _faceswap_progress_message(i, count),
+                    reply_markup=_cancel_job_keyboard(),
+                )
                 _log_faceswap_progress(
                     user_id,
                     i,
@@ -2047,8 +2263,10 @@ async def _execute_faceswap_batch(
                     detail=str(e),
                 )
             finally:
-                if i < count:
+                if not cancelled and i < count and not _job_cancelled(cancel_event):
                     await asyncio.sleep(REPLICATE_RATE_LIMIT_SEC)
+                elif _job_cancelled(cancel_event):
+                    cancelled = True
 
         send_error = None
         if result_paths:
@@ -2072,8 +2290,15 @@ async def _execute_faceswap_batch(
         if send_error:
             failures.append(f"envio a Telegram: {send_error}")
 
-        await status_msg.edit_text(
-            _format_faceswap_batch_status(len(result_paths), count, failures)
+        await safe_edit_text(
+            status_msg,
+            _format_faceswap_batch_status(
+                len(result_paths),
+                count,
+                failures,
+                cancelled=cancelled,
+            ),
+            reply_markup=None,
         )
     except Exception as e:
         print(f"[faceswap] batch unexpected error: {e}")
@@ -2082,10 +2307,18 @@ async def _execute_faceswap_batch(
                 await _send_faceswap_photos(anchor_message, result_paths)
             except Exception as send_exc:
                 print(f"[faceswap] rescue send error: {send_exc}")
-        await status_msg.edit_text(
-            _format_faceswap_batch_status(len(result_paths), count, failures or [str(e)])
+        await safe_edit_text(
+            status_msg,
+            _format_faceswap_batch_status(
+                len(result_paths),
+                count,
+                failures or [str(e)],
+                cancelled=cancelled or _job_cancelled(cancel_event),
+            ),
+            reply_markup=None,
         )
     finally:
+        _finish_job(user_id, cancel_event)
         download.cleanup_temp_files(downloaded)
         shutil.rmtree(temp_root, ignore_errors=True)
 

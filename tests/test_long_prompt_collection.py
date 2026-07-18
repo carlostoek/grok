@@ -342,7 +342,12 @@ async def test_handle_text_collection_skips_confirm_flow(sessions_file):
                 await bot.handle_text(msg)
 
     kwargs = msg.answer.await_args_list[0].kwargs
-    assert kwargs.get("reply_markup") is None
+    # In-flight edit status exposes Cancelar (cancel_job), not confirm:yes/no.
+    markup = kwargs.get("reply_markup")
+    assert markup is not None
+    buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "cancel_job" in buttons
+    assert "confirm:yes" not in buttons
 
 
 @pytest.mark.asyncio
