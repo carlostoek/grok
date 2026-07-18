@@ -289,7 +289,7 @@ async def test_grok_album_stops_on_error(album_tasks, sessions_file):
 
 
 @pytest.mark.asyncio
-async def test_faceswap_album_unchanged(album_tasks, sessions_file, tmp_path):
+async def test_faceswap_album_shows_confirmation(album_tasks, sessions_file, tmp_path):
     uid = 1108
     bot.get_user_state(uid)["model"] = "faceswap"
     source = tmp_path / "source.jpg"
@@ -299,17 +299,16 @@ async def test_faceswap_album_unchanged(album_tasks, sessions_file, tmp_path):
     msg = _make_album_message(user_id=uid, message_id=80, file_id="p80")
 
     with patch.object(bot, "_process_batch_replicate_sync", return_value={"processed": 1}) as mock_batch:
-        with patch(
-            "bot.download.download_telegram_photo",
-            new_callable=AsyncMock,
-            return_value=tmp_path / "target.jpg",
-        ):
-            with patch.object(bot, "generate_image", new_callable=AsyncMock) as mock_gen:
-                await bot.handle_album(msg)
-                await _drain_album_tasks(album_tasks)
+        with patch.object(bot, "generate_image", new_callable=AsyncMock) as mock_gen:
+            await bot.handle_album(msg)
+            await _drain_album_tasks(album_tasks)
 
-    mock_batch.assert_called_once()
+    mock_batch.assert_not_called()
     mock_gen.assert_not_called()
+    msg.answer.assert_awaited_once()
+    assert "Confirmas hacer face swap" in msg.answer.await_args.args[0]
+    assert bot.get_user_state(uid)["pending_faceswap_file_ids"] == ["p80"]
+    assert msg.answer.await_args.kwargs.get("reply_markup") is not None
 
 
 @pytest.mark.asyncio

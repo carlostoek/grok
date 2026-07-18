@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 import bot
 import sessions
@@ -284,6 +285,62 @@ async def test_faceswap_batch_partial_failure_still_delivers(sessions_file, tmp_
     assert "2/3" in final_status
     assert "Fallos" in final_status
     assert "imagen 3" in final_status
+
+
+@pytest.mark.asyncio
+async def test_faceswap_batch_ignores_message_not_modified(sessions_file, tmp_path):
+    """Redundant progress edits must not abort the batch (Telegram 400)."""
+    uid = 1205
+    bot.get_user_state(uid)["model"] = "faceswap"
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"source-bytes")
+    bot.get_user_state(uid)["source_path"] = str(source)
+    bot.get_user_state(uid)["pending_faceswap_file_ids"] = ["p1", "p2", "p3"]
+
+    callback = MagicMock()
+    callback.from_user.id = uid
+    callback.data = "confirm:yes"
+    callback.message = MagicMock()
+    callback.answer = AsyncMock()
+    callback.message.reply_media_group = AsyncMock()
+
+    last_text: list[str] = []
+
+    async def _edit_text(text, **kwargs):
+        if last_text and last_text[-1] == text:
+            raise TelegramBadRequest(
+                method="editMessageText",
+                message="Bad Request: message is not modified: specified new message content "
+                "and reply markup are exactly the same as a current content and reply markup "
+                "of the message",
+            )
+        last_text.append(text)
+
+    callback.message.edit_text = AsyncMock(side_effect=_edit_text)
+
+    def _fake_swap(source_path, target_path, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result = output_dir / target_path.name
+        result.write_bytes(b"swap-bytes")
+        return result
+
+    async def _fake_download(_bot, file_id, temp_dir):
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        path = temp_dir / f"{file_id}.jpg"
+        path.write_bytes(b"target")
+        return path
+
+    with patch.object(bot, "_faceswap_replicate_single", side_effect=_fake_swap):
+        with patch("bot.download.download_telegram_photo", side_effect=_fake_download):
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await bot.handle_confirm_generation(callback)
+
+    callback.message.reply_media_group.assert_awaited_once()
+    sent_media = callback.message.reply_media_group.await_args.args[0]
+    assert len(sent_media) == 3
+    final_status = callback.message.edit_text.await_args_list[-1].args[0]
+    assert "3/3" in final_status
+    assert "Fallos" not in final_status
 
 
 @pytest.mark.asyncio
